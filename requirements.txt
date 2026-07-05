@@ -1,0 +1,4 @@
+numpy>=1.26
+opencv-python>=4.10
+Pillow>=10.0
+python-vlc>=3.0.21203

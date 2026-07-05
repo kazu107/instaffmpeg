@@ -1,0 +1,17 @@
+cache/*
+!cache/.gitkeep
+
+workspace/data/raw/*
+!workspace/data/raw/.gitkeep
+
+workspace/data/processed/*
+!workspace/data/processed/.gitkeep
+
+workspace/outputs/*
+!workspace/outputs/.gitkeep
+
+__pycache__/
+*.pyc
+.insta360_frame_extractor_gui.settings.json
+.codex/
+.agents/

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
@@ -22,11 +23,18 @@ DEFAULT_FOV = 90.0
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 DEFAULT_PARALLELISM = max(1, min(4, os.cpu_count() or 1))
-DEFAULT_PREVIEW_CANVAS_WIDTH = 800
-DEFAULT_PREVIEW_CANVAS_HEIGHT = 400
-MIN_PREVIEW_CANVAS_WIDTH = 480
-MIN_PREVIEW_CANVAS_HEIGHT = 240
-DEFAULT_SPHERE_CANVAS_SIZE = 280
+MIN_WINDOW_FLOOR_WIDTH = 480
+MIN_WINDOW_FLOOR_HEIGHT = 240
+# プレビュー領域はウィンドウに追従して伸縮するため、ウィジェットの要求サイズは
+# 小さくしておき、実際の表示サイズは <Configure> で決める。
+PREVIEW_SURFACE_MIN_WIDTH = 320
+PREVIEW_SURFACE_MIN_HEIGHT = 180
+DEFAULT_SPHERE_CANVAS_SIZE = 140
+MIN_SNAPSHOT_SIZE = 16
+WINDOW_MAX_SCREEN_WIDTH_RATIO = 0.95
+WINDOW_MAX_SCREEN_HEIGHT_RATIO = 0.92
+PREFERRED_WINDOW_WIDTH = 1440
+PREFERRED_WINDOW_HEIGHT = 1020
 PREVIEW_PROXY_FPS_LIMIT = 15.0
 SETTINGS_FILE_NAME = ".insta360_frame_extractor_gui.settings.json"
 SEGFORMER_MODEL_ID = "nvidia/segformer-b0-finetuned-ade-512-512"
@@ -34,13 +42,16 @@ MASK_CATEGORY_LABEL_TOKENS: dict[str, tuple[str, ...]] = {
     "sky": ("sky",),
     "person": ("person",),
     "car": ("car",),
+    "tree": ("tree",),
 }
 MASK_CATEGORY_DISPLAY_NAMES: dict[str, str] = {
     "sky": "空",
     "person": "人",
     "car": "車",
+    "tree": "木",
 }
 MASK_BATCH_SIZE_LIMIT = 8
+SETTINGS_COLUMN_COUNT = 8
 DEFAULT_MASK_DETAIL_LEVEL = "標準"
 DEFAULT_MASK_CONFIDENCE_THRESHOLD = 0.7
 MASK_DETAIL_PRESETS: dict[str, dict[str, int | bool]] = {
@@ -175,10 +186,11 @@ def parse_probability_threshold(value: str, label: str) -> float:
     try:
         parsed = float(value)
     except ValueError as exc:
-        raise ValueError(f"{label}は0から1の数値で入力してください。") from exc
+        raise ValueError(f"{label}は0より大きく1以下の数値で入力してください。") from exc
 
-    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
-        raise ValueError(f"{label}は0から1の範囲で指定してください。")
+    # 0 を許すと「確率 >= 0」が常に真になり全面除外マスクになるため下限は開区間。
+    if not math.isfinite(parsed) or not 0.0 < parsed <= 1.0:
+        raise ValueError(f"{label}は0より大きく1以下の範囲で指定してください。")
     return parsed
 
 
@@ -245,6 +257,13 @@ def build_mask_output_path(image_path: Path) -> Path:
     return image_path.with_name(image_path.name + ".mask.png")
 
 
+def build_extracted_image_glob(video_stem: str | None) -> str:
+    """抽出済み JPG を拾う glob パターン。動画名の `[` `]` `*` `?` を無効化する。"""
+    if not video_stem:
+        return "*.jpg"
+    return f"{glob.escape(video_stem)}_*.jpg"
+
+
 def resolve_mask_detail_preset(level_name: str) -> dict[str, int | bool]:
     return MASK_DETAIL_PRESETS.get(level_name, MASK_DETAIL_PRESETS[DEFAULT_MASK_DETAIL_LEVEL])
 
@@ -283,23 +302,6 @@ def mask_contains_excluded_region(binary_mask: object) -> bool:
 
     mask_array = np.asarray(binary_mask, dtype=np.uint8)
     return bool(np.any(mask_array == 0))
-
-
-def resize_label_prediction_nearest(
-    prediction: object,
-    target_size: tuple[int, int],
-) -> object:
-    import numpy as np
-    from PIL import Image
-
-    prediction_array = np.asarray(prediction, dtype=np.uint8)
-    label_image = Image.fromarray(prediction_array)
-    try:
-        resampling = Image.Resampling.NEAREST
-    except AttributeError:
-        resampling = Image.NEAREST
-    resized_image = label_image.resize(target_size, resample=resampling)
-    return np.asarray(resized_image, dtype=np.uint8)
 
 
 def build_tile_starts(full_size: int, tile_size: int, overlap: int) -> list[int]:
@@ -474,11 +476,17 @@ def compute_preview_box(
     canvas_width: int,
     canvas_height: int,
 ) -> tuple[float, float, float, float]:
-    scale = min(canvas_width / source_width, canvas_height / source_height)
-    display_width = source_width * scale
-    display_height = source_height * scale
-    offset_x = (canvas_width - display_width) / 2.0
-    offset_y = (canvas_height - display_height) / 2.0
+    # 極端に小さい / 壊れたサイズでも 0 除算せずに描画できる値を返す。
+    safe_source_width = max(1, int(source_width))
+    safe_source_height = max(1, int(source_height))
+    safe_canvas_width = max(1, int(canvas_width))
+    safe_canvas_height = max(1, int(canvas_height))
+
+    scale = min(safe_canvas_width / safe_source_width, safe_canvas_height / safe_source_height)
+    display_width = safe_source_width * scale
+    display_height = safe_source_height * scale
+    offset_x = (safe_canvas_width - display_width) / 2.0
+    offset_y = (safe_canvas_height - display_height) / 2.0
     return offset_x, offset_y, display_width, display_height
 
 
@@ -489,12 +497,17 @@ def fit_size_within_bounds(
     max_height: int,
     allow_upscale: bool = False,
 ) -> tuple[int, int]:
-    scale = min(max_width / source_width, max_height / source_height)
+    safe_source_width = max(1, int(source_width))
+    safe_source_height = max(1, int(source_height))
+    safe_max_width = max(1, int(max_width))
+    safe_max_height = max(1, int(max_height))
+
+    scale = min(safe_max_width / safe_source_width, safe_max_height / safe_source_height)
     if not allow_upscale:
         scale = min(scale, 1.0)
 
-    target_width = max(1, int(round(source_width * scale)))
-    target_height = max(1, int(round(source_height * scale)))
+    target_width = max(1, min(safe_max_width, int(round(safe_source_width * scale))))
+    target_height = max(1, min(safe_max_height, int(round(safe_source_height * scale))))
     return target_width, target_height
 
 
@@ -746,13 +759,22 @@ def probe_video_metadata(video_path: Path, ffprobe_path: str) -> VideoMetadata:
         raise RuntimeError("動画ストリームが見つかりませんでした。")
 
     stream = streams[0]
-    width = int(stream["width"])
-    height = int(stream["height"])
+    try:
+        width = int(stream["width"])
+        height = int(stream["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("動画の解像度を取得できませんでした。") from exc
+
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"動画の解像度が不正です: {width}x{height}")
 
     duration_text = payload.get("format", {}).get("duration")
     try:
         duration_seconds = float(duration_text) if duration_text is not None else None
     except (TypeError, ValueError):
+        duration_seconds = None
+
+    if duration_seconds is not None and (not math.isfinite(duration_seconds) or duration_seconds <= 0.0):
         duration_seconds = None
 
     return VideoMetadata(width=width, height=height, duration_seconds=duration_seconds)
@@ -861,7 +883,7 @@ class SegFormerMaskGenerator:
         self.excluded_label_groups = collect_segformer_excluded_label_groups(self.id2label)
         self.excluded_label_ids = collect_segformer_excluded_label_ids(self.id2label)
         if not self.excluded_label_ids:
-            raise RuntimeError("SegFormer のラベルから sky / person / car を解決できませんでした。")
+            raise RuntimeError("SegFormer のラベルから sky / person / car / tree を解決できませんでした。")
 
     def device_label(self) -> str:
         return str(self.device)
@@ -1052,11 +1074,10 @@ class SegFormerMaskGenerator:
 class Insta360ExtractorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.min_window_width = 1180
-        self.min_window_height = 780
+        # 最小サイズは UI 構築後に実際の要求サイズから決めるため、ここでは暫定値。
+        self.min_window_width = MIN_WINDOW_FLOOR_WIDTH
+        self.min_window_height = MIN_WINDOW_FLOOR_HEIGHT
         self.root.title("Insta360 Frame Extractor")
-        self.root.geometry("1280x900")
-        self.root.minsize(self.min_window_width, self.min_window_height)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.ffmpeg_path = shutil.which("ffmpeg")
@@ -1081,6 +1102,7 @@ class Insta360ExtractorApp:
         self.mask_sky_var = tk.BooleanVar(value=True)
         self.mask_person_var = tk.BooleanVar(value=True)
         self.mask_car_var = tk.BooleanVar(value=True)
+        self.mask_tree_var = tk.BooleanVar(value=True)
         self.yaw_var = tk.StringVar(value="0")
         self.pitch_var = tk.StringVar(value="0")
         self.ring_count_var = tk.StringVar(value="8")
@@ -1092,7 +1114,8 @@ class Insta360ExtractorApp:
         self.direction_sets: list[DirectionSet] = [DirectionSet(name="セット1", directions=[Direction(yaw=0.0, pitch=0.0)])]
         self.active_direction_set_index = 0
         self.directions: list[Direction] = self.direction_sets[0].directions
-        self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        # "log" / "status" / "error" は str、プレビュー関連は dict を載せる。
+        self.log_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.stop_requested = threading.Event()
         self.process_lock = threading.Lock()
@@ -1103,8 +1126,13 @@ class Insta360ExtractorApp:
         self.preview_path: Path | None = None
         self.preview_metadata: VideoMetadata | None = None
         self.preview_box: tuple[float, float, float, float] | None = None
-        self.preview_canvas_width = DEFAULT_PREVIEW_CANVAS_WIDTH
-        self.preview_canvas_height = DEFAULT_PREVIEW_CANVAS_HEIGHT
+        self.preview_canvas_width = PREVIEW_SURFACE_MIN_WIDTH
+        self.preview_canvas_height = PREVIEW_SURFACE_MIN_HEIGHT
+        self.preview_canvas_offset_x = 0
+        self.preview_canvas_offset_y = 0
+        self.preview_last_frame_bgr: object | None = None
+        self.preview_photo_from_snapshot = False
+        self.preview_mode = "none"
         self.preview_capture: object | None = None
         self.preview_proxy_path: Path | None = None
         self.preview_current_video_path: Path | None = None
@@ -1140,7 +1168,47 @@ class Insta360ExtractorApp:
         self._load_persisted_settings()
         self._refresh_direction_tabs()
         self._refresh_direction_table(select_index=0)
-        self.root.after(100, self._drain_log_queue)
+        self._apply_window_size_limits(initialize=True)
+        self.log_drain_after_id: str | None = self.root.after(100, self._drain_log_queue)
+
+    def _window_size_ceiling(self) -> tuple[int, int]:
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        return (
+            max(MIN_WINDOW_FLOOR_WIDTH, int(screen_width * WINDOW_MAX_SCREEN_WIDTH_RATIO)),
+            max(MIN_WINDOW_FLOOR_HEIGHT, int(screen_height * WINDOW_MAX_SCREEN_HEIGHT_RATIO)),
+        )
+
+    def _apply_window_size_limits(self, initialize: bool = False) -> None:
+        """UI の実要求サイズから最小ウィンドウサイズを決める。
+
+        最小サイズを実測から決めることで「縮めるとボタンが消える」状態を作れなくする。
+        方向セットのタブが増えて必要幅が伸びた場合も追従できるよう、初回以降は
+        最小サイズを広げる方向にだけ更新する。
+        """
+        self.root.update_idletasks()
+        max_width, max_height = self._window_size_ceiling()
+
+        required_width = min(self.root.winfo_reqwidth(), max_width)
+        required_height = min(self.root.winfo_reqheight(), max_height)
+        if initialize:
+            self.min_window_width = required_width
+            self.min_window_height = required_height
+        else:
+            self.min_window_width = max(self.min_window_width, required_width)
+            self.min_window_height = max(self.min_window_height, required_height)
+        self.root.minsize(self.min_window_width, self.min_window_height)
+
+        if initialize:
+            target_width = min(max(self.min_window_width, PREFERRED_WINDOW_WIDTH), max_width)
+            target_height = min(max(self.min_window_height, PREFERRED_WINDOW_HEIGHT), max_height)
+        else:
+            # 既にユーザーが決めたサイズは尊重し、最小を下回る時だけ広げる。
+            target_width = max(self.root.winfo_width(), self.min_window_width)
+            target_height = max(self.root.winfo_height(), self.min_window_height)
+            if target_width <= self.root.winfo_width() and target_height <= self.root.winfo_height():
+                return
+        self.root.geometry(f"{target_width}x{target_height}")
 
     def _build_ui(self) -> None:
         root_frame = ttk.Frame(self.root, padding=16)
@@ -1166,114 +1234,118 @@ class Insta360ExtractorApp:
 
         settings_frame = ttk.LabelFrame(root_frame, text="書き出し設定", padding=12)
         settings_frame.pack(fill="x", pady=(12, 0))
-        for column in range(9):
-            settings_frame.columnconfigure(column, weight=1 if column % 2 else 0)
+        # 偶数列 = 見出しラベル (固定幅) / 奇数列 = 入力欄 (余白を分配)。
+        # 複数のコントロールをまとめたい行は内側 Frame を使い、列構成を崩さない。
+        for column in range(SETTINGS_COLUMN_COUNT):
+            settings_frame.columnconfigure(column, weight=0 if column % 2 == 0 else 1)
 
-        ttk.Label(settings_frame, text="FPS").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
+        def settings_label(text: str, row: int, column: int) -> None:
+            padx = (0, 8) if column == 0 else (16, 8)
+            ttk.Label(settings_frame, text=text).grid(row=row, column=column, sticky="w", padx=padx, pady=6)
+
+        def settings_group(row: int, column: int, columnspan: int = 1) -> ttk.Frame:
+            group = ttk.Frame(settings_frame)
+            group.grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=6)
+            return group
+
+        settings_label("FPS", 0, 0)
         ttk.Entry(settings_frame, width=12, textvariable=self.fps_var).grid(row=0, column=1, sticky="w", pady=6)
 
-        ttk.Label(settings_frame, text="画角 (h_fov)").grid(row=0, column=2, sticky="w", padx=(16, 8), pady=6)
+        settings_label("画角 (h_fov)", 0, 2)
         ttk.Entry(settings_frame, width=12, textvariable=self.fov_var).grid(row=0, column=3, sticky="w", pady=6)
 
-        ttk.Label(settings_frame, text="幅").grid(row=0, column=4, sticky="w", padx=(16, 8), pady=6)
+        settings_label("幅", 0, 4)
         ttk.Entry(settings_frame, width=12, textvariable=self.width_var).grid(row=0, column=5, sticky="w", pady=6)
 
-        ttk.Label(settings_frame, text="高さ").grid(row=0, column=6, sticky="w", padx=(16, 8), pady=6)
+        settings_label("高さ", 0, 6)
         ttk.Entry(settings_frame, width=12, textvariable=self.height_var).grid(row=0, column=7, sticky="w", pady=6)
 
-        ttk.Label(settings_frame, text="並列数").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
+        settings_label("並列数", 1, 0)
         ttk.Entry(settings_frame, width=12, textvariable=self.parallelism_var).grid(row=1, column=1, sticky="w", pady=6)
 
-        ttk.Label(settings_frame, text="GPU").grid(row=1, column=2, sticky="w", padx=(16, 8), pady=6)
+        settings_label("GPU", 1, 2)
+        gpu_group = settings_group(1, 3)
         gpu_check = ttk.Checkbutton(
-            settings_frame,
+            gpu_group,
             text="CUDAデコードを使う",
             variable=self.use_gpu_var,
         )
-        gpu_check.grid(row=1, column=3, sticky="w", pady=6)
+        gpu_check.pack(side="left")
         if not self.cuda_available:
             gpu_check.state(["disabled"])
+        gpu_status_text = "CUDA利用可" if self.cuda_available else "CUDA未検出"
+        ttk.Label(gpu_group, text=gpu_status_text).pack(side="left", padx=(12, 0))
 
-        ttk.Label(settings_frame, text="再生").grid(row=1, column=4, sticky="w", padx=(16, 8), pady=6)
+        settings_label("再生", 1, 4)
         ttk.Checkbutton(
             settings_frame,
             text="逆再生",
             variable=self.reverse_var,
         ).grid(row=1, column=5, sticky="w", pady=6)
 
-        gpu_status_text = "CUDA利用可" if self.cuda_available else "CUDA未検出"
-        ttk.Label(settings_frame, text=gpu_status_text).grid(row=1, column=6, columnspan=2, sticky="w", padx=(16, 8), pady=6)
-
-        ttk.Label(settings_frame, text="実行").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Checkbutton(
-            settings_frame,
-            text="画像抽出",
-            variable=self.run_extract_var,
-        ).grid(row=2, column=1, sticky="w", pady=6)
-        ttk.Checkbutton(
-            settings_frame,
-            text="マスク生成",
-            variable=self.generate_masks_var,
-        ).grid(row=2, column=2, sticky="w", pady=6)
-
-        ttk.Label(settings_frame, text="命名").grid(row=2, column=3, sticky="w", padx=(16, 8), pady=6)
+        settings_label("命名", 1, 6)
         ttk.Checkbutton(
             settings_frame,
             text="奇数フレームで方向indexを逆順",
             variable=self.reverse_direction_index_on_odd_var,
-        ).grid(row=2, column=4, columnspan=5, sticky="w", pady=6)
+        ).grid(row=1, column=7, sticky="w", pady=6)
 
-        ttk.Label(settings_frame, text="マスク").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Label(
-            settings_frame,
-            text="SegFormerで空・人・車を除外",
-        ).grid(row=3, column=1, columnspan=2, sticky="w", pady=6)
-        ttk.Label(settings_frame, text="マスク並列数").grid(row=3, column=3, sticky="e", padx=(8, 8), pady=6)
-        ttk.Entry(
-            settings_frame,
-            width=8,
-            textvariable=self.mask_parallelism_var,
-        ).grid(row=3, column=4, sticky="w", pady=6)
-        ttk.Label(settings_frame, text="細かさ").grid(row=3, column=5, sticky="w", padx=(16, 8), pady=6)
+        settings_label("実行", 2, 0)
+        run_group = settings_group(2, 1)
+        ttk.Checkbutton(run_group, text="画像抽出", variable=self.run_extract_var).pack(side="left")
+        ttk.Checkbutton(run_group, text="マスク生成", variable=self.generate_masks_var).pack(side="left", padx=(12, 0))
+
+        settings_label("マスク対象", 2, 2)
+        category_group = settings_group(2, 3, columnspan=SETTINGS_COLUMN_COUNT - 3)
+        for category_index, (category_text, category_var) in enumerate(
+            (
+                ("空", self.mask_sky_var),
+                ("人", self.mask_person_var),
+                ("車", self.mask_car_var),
+                ("木", self.mask_tree_var),
+            )
+        ):
+            ttk.Checkbutton(category_group, text=category_text, variable=category_var).pack(
+                side="left",
+                padx=(0, 0) if category_index == 0 else (14, 0),
+            )
+
+        settings_label("マスク", 3, 0)
+        mask_group = settings_group(3, 1, columnspan=SETTINGS_COLUMN_COUNT - 1)
+        ttk.Label(mask_group, text="SegFormerで対象を除外").pack(side="left")
+        ttk.Label(mask_group, text=f"バッチ数 (1-{MASK_BATCH_SIZE_LIMIT})").pack(side="left", padx=(16, 6))
+        ttk.Entry(mask_group, width=6, textvariable=self.mask_parallelism_var).pack(side="left")
+        ttk.Label(mask_group, text="細かさ").pack(side="left", padx=(16, 6))
         ttk.Combobox(
-            settings_frame,
+            mask_group,
             textvariable=self.mask_detail_level_var,
             values=list(MASK_DETAIL_PRESETS.keys()),
-            width=10,
+            width=8,
             state="readonly",
-        ).grid(row=3, column=6, sticky="w", pady=6)
-        ttk.Label(settings_frame, text="除外しきい値").grid(row=3, column=7, sticky="w", padx=(16, 8), pady=6)
-        ttk.Entry(
-            settings_frame,
-            width=10,
-            textvariable=self.mask_confidence_threshold_var,
-        ).grid(row=3, column=8, sticky="w", pady=6)
-        ttk.Label(settings_frame, text="対象").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Checkbutton(
-            settings_frame,
-            text="空",
-            variable=self.mask_sky_var,
-        ).grid(row=4, column=1, sticky="w", pady=6)
-        ttk.Checkbutton(
-            settings_frame,
-            text="人",
-            variable=self.mask_person_var,
-        ).grid(row=4, column=2, sticky="w", pady=6)
-        ttk.Checkbutton(
-            settings_frame,
-            text="車",
-            variable=self.mask_car_var,
-        ).grid(row=4, column=3, sticky="w", pady=6)
+        ).pack(side="left")
+        ttk.Label(mask_group, text="除外しきい値").pack(side="left", padx=(16, 6))
+        ttk.Entry(mask_group, width=8, textvariable=self.mask_confidence_threshold_var).pack(side="left")
+
         ttk.Label(
             settings_frame,
             text="mask は `元画像.jpg.mask.png` / 白=使用, 黒=除外",
-        ).grid(row=5, column=0, columnspan=8, sticky="w", padx=(0, 8), pady=6)
+        ).grid(row=4, column=0, columnspan=SETTINGS_COLUMN_COUNT, sticky="w", pady=(6, 0))
+
+        # 実行ボタンを含む操作バーを先に下端へ固定する。
+        # workspace より後に pack すると縦幅が足りない時に潰れて見えなくなる。
+        action_frame = ttk.Frame(root_frame, padding=(0, 12, 0, 0))
+        action_frame.pack(side="bottom", fill="x")
+
+        ttk.Label(action_frame, textvariable=self.status_var).pack(side="left")
+        ttk.Button(action_frame, text="停止", command=self._request_stop).pack(side="right")
+        ttk.Button(action_frame, text="実行", command=self._start_processing).pack(side="right", padx=(0, 8))
 
         workspace_frame = ttk.Frame(root_frame)
-        workspace_frame.pack(fill="both", expand=True, pady=(12, 0))
+        workspace_frame.pack(side="top", fill="both", expand=True, pady=(12, 0))
         workspace_frame.columnconfigure(0, weight=3)
         workspace_frame.columnconfigure(1, weight=2)
-        workspace_frame.rowconfigure(0, weight=3)
+        # 余ったスペースはプレビュー側 (row 0) を優先して広げる。
+        workspace_frame.rowconfigure(0, weight=4)
         workspace_frame.rowconfigure(1, weight=1)
 
         preview_frame = ttk.LabelFrame(workspace_frame, text="入力動画プレビュー", padding=12)
@@ -1281,19 +1353,31 @@ class Insta360ExtractorApp:
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
 
-        self.preview_media_frame = ttk.Frame(preview_frame)
+        self.preview_media_frame = ttk.Frame(
+            preview_frame,
+            width=PREVIEW_SURFACE_MIN_WIDTH,
+            height=PREVIEW_SURFACE_MIN_HEIGHT,
+        )
         self.preview_media_frame.grid(row=0, column=0, sticky="nsew")
+        # place した子でサイズが押し広げられないようにする (常に親の実サイズが正)。
+        self.preview_media_frame.pack_propagate(False)
+        self.preview_media_frame.grid_propagate(False)
         self.preview_media_frame.bind("<Configure>", self._on_preview_media_configure)
 
         self.preview_canvas = tk.Canvas(
             self.preview_media_frame,
-            width=self.preview_canvas_width,
-            height=self.preview_canvas_height,
+            width=PREVIEW_SURFACE_MIN_WIDTH,
+            height=PREVIEW_SURFACE_MIN_HEIGHT,
             background="#0f172a",
             highlightthickness=1,
             highlightbackground="#334155",
         )
-        self.preview_canvas.place(x=0, y=0, width=self.preview_canvas_width, height=self.preview_canvas_height)
+        self.preview_canvas.place(
+            x=0,
+            y=0,
+            width=PREVIEW_SURFACE_MIN_WIDTH,
+            height=PREVIEW_SURFACE_MIN_HEIGHT,
+        )
 
         self.preview_video_frame = tk.Frame(
             self.preview_media_frame,
@@ -1353,95 +1437,109 @@ class Insta360ExtractorApp:
             command=self._add_direction_set,
         ).grid(row=0, column=2, sticky="e")
 
+        # Treeview とスクロールバーは専用フレームに入れる。
+        # 同じセルに grid すると重なってテーブルの右端を覆ってしまう。
+        table_frame = ttk.Frame(directions_frame)
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
         self.direction_table = ttk.Treeview(
-            directions_frame,
+            table_frame,
             columns=("index", "yaw", "pitch"),
             show="headings",
             selectmode="browse",
-            height=12,
+            # 要求高さを小さくしておき、余ったスペースは weight で伸ばす。
+            height=4,
         )
         self.direction_table.heading("index", text="index")
         self.direction_table.heading("yaw", text="yaw")
         self.direction_table.heading("pitch", text="pitch")
-        self.direction_table.column("index", width=80, anchor="center")
-        self.direction_table.column("yaw", width=120, anchor="center")
-        self.direction_table.column("pitch", width=120, anchor="center")
-        self.direction_table.grid(row=1, column=0, sticky="nsew")
+        self.direction_table.column("index", width=56, minwidth=44, anchor="center")
+        self.direction_table.column("yaw", width=84, minwidth=60, anchor="center")
+        self.direction_table.column("pitch", width=84, minwidth=60, anchor="center")
+        self.direction_table.grid(row=0, column=0, sticky="nsew")
         self.direction_table.bind("<<TreeviewSelect>>", self._on_direction_selected)
 
-        table_scroll = ttk.Scrollbar(directions_frame, orient="vertical", command=self.direction_table.yview)
-        table_scroll.grid(row=1, column=0, sticky="nse")
+        table_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.direction_table.yview)
+        table_scroll.grid(row=0, column=1, sticky="ns")
         self.direction_table.configure(yscrollcommand=table_scroll.set)
 
-        editor_frame = ttk.Frame(directions_frame, padding=(16, 0, 0, 0))
+        editor_frame = ttk.Frame(directions_frame, padding=(12, 0, 0, 0))
         editor_frame.grid(row=1, column=1, sticky="nsew")
         editor_frame.columnconfigure(1, weight=1)
+        editor_frame.columnconfigure(3, weight=1)
 
-        ttk.Label(editor_frame, text="yaw").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(editor_frame, textvariable=self.yaw_var).grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Label(editor_frame, text="yaw").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=(0, 6))
+        ttk.Entry(editor_frame, textvariable=self.yaw_var, width=8).grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        ttk.Label(editor_frame, text="pitch").grid(row=0, column=2, sticky="w", padx=(10, 6), pady=(0, 6))
+        ttk.Entry(editor_frame, textvariable=self.pitch_var, width=8).grid(row=0, column=3, sticky="ew", pady=(0, 6))
 
-        ttk.Label(editor_frame, text="pitch").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(editor_frame, textvariable=self.pitch_var).grid(row=1, column=1, sticky="ew", pady=6)
+        button_frame = ttk.Frame(editor_frame)
+        button_frame.grid(row=1, column=0, columnspan=4, sticky="ew")
+        for button_column in range(4):
+            button_frame.columnconfigure(button_column, weight=1)
+        for button_column, (button_text, button_command) in enumerate(
+            (
+                ("追加", self._add_direction),
+                ("更新", self._update_selected_direction),
+                ("削除", self._remove_selected_direction),
+                ("全削除", self._clear_directions),
+            )
+        ):
+            ttk.Button(button_frame, text=button_text, width=6, command=button_command).grid(
+                row=0,
+                column=button_column,
+                sticky="ew",
+                padx=(0 if button_column == 0 else 4, 0),
+            )
 
-        ttk.Button(editor_frame, text="追加", command=self._add_direction).grid(row=2, column=0, sticky="ew", pady=(10, 6))
-        ttk.Button(editor_frame, text="更新", command=self._update_selected_direction).grid(
-            row=2,
-            column=1,
-            sticky="ew",
-            pady=(10, 6),
-            padx=(8, 0),
-        )
-        ttk.Button(editor_frame, text="削除", command=self._remove_selected_direction).grid(
-            row=3,
-            column=0,
-            sticky="ew",
-            pady=6,
-        )
-        ttk.Button(editor_frame, text="全削除", command=self._clear_directions).grid(
-            row=3,
-            column=1,
-            sticky="ew",
-            pady=6,
-            padx=(8, 0),
-        )
-
-        preset_frame = ttk.LabelFrame(editor_frame, text="水平リング生成", padding=10)
-        preset_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        preset_frame = ttk.LabelFrame(editor_frame, text="水平リング生成", padding=8)
+        preset_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         preset_frame.columnconfigure(1, weight=1)
+        preset_frame.columnconfigure(3, weight=1)
 
-        ttk.Label(preset_frame, text="方向数").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(preset_frame, textvariable=self.ring_count_var, width=10).grid(row=0, column=1, sticky="w", pady=4)
-
-        ttk.Label(preset_frame, text="pitch").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(preset_frame, textvariable=self.ring_pitch_var, width=10).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(preset_frame, text="方向数").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(preset_frame, textvariable=self.ring_count_var, width=6).grid(row=0, column=1, sticky="ew")
+        ttk.Label(preset_frame, text="pitch").grid(row=0, column=2, sticky="w", padx=(10, 6))
+        ttk.Entry(preset_frame, textvariable=self.ring_pitch_var, width=6).grid(row=0, column=3, sticky="ew")
 
         ttk.Button(preset_frame, text="生成して置換", command=self._replace_with_ring).grid(
-            row=2,
+            row=1,
             column=0,
-            columnspan=2,
+            columnspan=4,
             sticky="ew",
             pady=(8, 0),
         )
 
-        preview_status_frame = ttk.Frame(editor_frame, padding=(0, 16, 0, 0))
-        preview_status_frame.grid(row=5, column=0, columnspan=2, sticky="ew")
+        preview_status_frame = ttk.Frame(editor_frame, padding=(0, 10, 0, 0))
+        preview_status_frame.grid(row=3, column=0, columnspan=4, sticky="nsew")
         preview_status_frame.columnconfigure(0, weight=1)
+        editor_frame.rowconfigure(3, weight=1)
 
-        ttk.Label(preview_status_frame, textvariable=self.preview_info_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(preview_status_frame, textvariable=self.preview_selection_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(
+        self.preview_info_label = ttk.Label(preview_status_frame, textvariable=self.preview_info_var, justify="left")
+        self.preview_info_label.grid(row=0, column=0, sticky="w")
+        self.preview_selection_label = ttk.Label(
+            preview_status_frame,
+            textvariable=self.preview_selection_var,
+            justify="left",
+        )
+        self.preview_selection_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.preview_legend_label = ttk.Label(
             preview_status_frame,
             text="色ごとの枠と点が書き出し位置です。白い外枠が選択中の方向です。",
-            wraplength=320,
             justify="left",
-        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        )
+        self.preview_legend_label.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        # 折り返し幅は実際の列幅に追従させる (固定値だと狭い時に切れる)。
+        preview_status_frame.bind("<Configure>", self._on_preview_status_configure)
 
         log_frame = ttk.LabelFrame(workspace_frame, text="ログ", padding=12)
         log_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
 
-        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
+        self.log_text = tk.Text(log_frame, height=4, width=40, wrap="word", state="disabled")
         self.log_text.grid(row=0, column=0, sticky="nsew")
 
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
@@ -1466,27 +1564,37 @@ class Insta360ExtractorApp:
         self.sphere_canvas.bind("<B1-Motion>", self._on_sphere_drag)
         self.sphere_canvas.bind("<Configure>", self._on_sphere_canvas_configure)
 
-        ttk.Label(
+        self.sphere_hint_label = ttk.Label(
             sphere_frame,
             text="ドラッグで回転。手前ほど明るく、視野枠も表示します。",
-        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
-
-        action_frame = ttk.Frame(root_frame, padding=(0, 12, 0, 0))
-        action_frame.pack(fill="x")
-
-        ttk.Label(action_frame, textvariable=self.status_var).pack(side="left")
-        ttk.Button(action_frame, text="停止", command=self._request_stop).pack(side="right")
-        ttk.Button(action_frame, text="実行", command=self._start_processing).pack(side="right", padx=(0, 8))
+            justify="left",
+        )
+        self.sphere_hint_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        sphere_frame.bind("<Configure>", self._on_sphere_frame_configure)
 
         self._refresh_direction_tabs()
         self._render_preview_overlay()
+
+    def _on_preview_status_configure(self, event: tk.Event[tk.Misc]) -> None:
+        wrap_length = max(120, int(event.width) - 4)
+        for label in (self.preview_info_label, self.preview_selection_label, self.preview_legend_label):
+            label.configure(wraplength=wrap_length)
+
+    def _on_sphere_frame_configure(self, event: tk.Event[tk.Misc]) -> None:
+        self.sphere_hint_label.configure(wraplength=max(120, int(event.width) - 24))
 
     def _bind_preview_refresh(self) -> None:
         for variable in (self.fov_var, self.width_var, self.height_var):
             variable.trace_add("write", self._on_preview_settings_changed)
         self.preview_overlay_sync_var.trace_add("write", self._on_preview_mode_changed)
 
+    def _sync_active_direction_set(self) -> None:
+        """表示中の方向リストをアクティブな DirectionSet に確実に反映させる。"""
+        if 0 <= self.active_direction_set_index < len(self.direction_sets):
+            self.direction_sets[self.active_direction_set_index].directions = self.directions
+
     def _build_settings_payload(self) -> dict[str, object]:
+        self._sync_active_direction_set()
         return {
             "input_path": self.input_path_var.get().strip(),
             "output_dir": self.output_dir_var.get().strip(),
@@ -1506,6 +1614,7 @@ class Insta360ExtractorApp:
             "mask_sky": bool(self.mask_sky_var.get()),
             "mask_person": bool(self.mask_person_var.get()),
             "mask_car": bool(self.mask_car_var.get()),
+            "mask_tree": bool(self.mask_tree_var.get()),
             "preview_overlay_sync": bool(self.preview_overlay_sync_var.get()),
             "yaw": self.yaw_var.get().strip(),
             "pitch": self.pitch_var.get().strip(),
@@ -1612,6 +1721,7 @@ class Insta360ExtractorApp:
             ("mask_sky", self.mask_sky_var),
             ("mask_person", self.mask_person_var),
             ("mask_car", self.mask_car_var),
+            ("mask_tree", self.mask_tree_var),
             ("preview_overlay_sync", self.preview_overlay_sync_var),
         ):
             saved_value = payload.get(key)
@@ -1681,9 +1791,14 @@ class Insta360ExtractorApp:
             )
             button.pack(side="left", padx=(0, 6))
 
+        # タブが増えて必要幅が伸びたら最小ウィンドウサイズも追従させる。
+        if getattr(self, "log_drain_after_id", None) is not None:
+            self._apply_window_size_limits()
+
     def _switch_direction_set(self, index: int) -> None:
         if not 0 <= index < len(self.direction_sets):
             return
+        self._sync_active_direction_set()
         self.active_direction_set_index = index
         self.directions = self.direction_sets[index].directions
         self._refresh_direction_tabs()
@@ -1691,6 +1806,7 @@ class Insta360ExtractorApp:
         self.status_var.set(f"{self.direction_sets[index].name} に切り替えました。")
 
     def _add_direction_set(self) -> None:
+        self._sync_active_direction_set()
         next_index = len(self.direction_sets) + 1
         existing_names = {direction_set.name for direction_set in self.direction_sets}
         candidate_name = f"セット{next_index}"
@@ -1728,11 +1844,14 @@ class Insta360ExtractorApp:
             selected_categories.append("person")
         if self.mask_car_var.get():
             selected_categories.append("car")
+        if self.mask_tree_var.get():
+            selected_categories.append("tree")
         return selected_categories
 
     def _build_mask_image_jobs(self, output_dir: Path, video_stem: str | None) -> list[ExtractedImageJob]:
-        pattern = f"{video_stem}_*.jpg" if video_stem else "*.jpg"
-        image_paths = sorted(output_dir.glob(pattern))
+        if not output_dir.is_dir():
+            return []
+        image_paths = sorted(output_dir.glob(build_extracted_image_glob(video_stem)))
         return [
             ExtractedImageJob(
                 image_path=image_path,
@@ -1751,12 +1870,12 @@ class Insta360ExtractorApp:
         if self.preview_proxy_path is not None:
             self.preview_proxy_path.unlink(missing_ok=True)
             self.preview_proxy_path = None
-        if self.preview_vlc_player is not None:
-            try:
-                self.preview_vlc_player.stop()
-            except Exception:
-                pass
+        self._stop_preview_vlc()
+        # VLC を使うかどうかはモードで判定する。プレイヤーの生存で判定すると
+        # 一度高速再生を使った後に「枠位置優先」へ戻せなくなる。
+        self.preview_mode = "none"
         self.preview_current_video_path = None
+        self.preview_last_frame_bgr = None
         self.preview_total_frames = 0
         self.preview_current_frame_index = 0
         self.preview_fps = 0.0
@@ -1788,7 +1907,31 @@ class Insta360ExtractorApp:
         self._cancel_preview_seek()
 
     def _preview_uses_vlc(self) -> bool:
-        return self.preview_vlc_player is not None
+        return self.preview_mode == "vlc" and self.preview_vlc_player is not None
+
+    def _stop_preview_vlc(self) -> None:
+        if self.preview_vlc_player is None:
+            return
+        try:
+            self.preview_vlc_player.stop()
+        except Exception:
+            pass
+
+    def _release_preview_vlc(self) -> None:
+        self._cancel_preview_vlc_poll()
+        self._cancel_preview_snapshot()
+        self._stop_preview_vlc()
+        for attribute in ("preview_vlc_player", "preview_vlc_instance"):
+            handle = getattr(self, attribute)
+            if handle is None:
+                continue
+            try:
+                handle.release()
+            except Exception:
+                pass
+            setattr(self, attribute, None)
+        self.preview_vlc_module = None
+        self.preview_mode = "none"
 
     def _cancel_preview_vlc_poll(self) -> None:
         if self.preview_vlc_poll_after_id is not None:
@@ -1800,13 +1943,29 @@ class Insta360ExtractorApp:
             self.root.after_cancel(self.preview_snapshot_after_id)
             self.preview_snapshot_after_id = None
 
+    def _preview_surface_bounds(self) -> tuple[int, int]:
+        """プレビューを描ける実領域。ウィジェットが未実体化の間は最小値を返す。"""
+        available_width = self.preview_media_frame.winfo_width()
+        available_height = self.preview_media_frame.winfo_height()
+        if available_width <= 1 or available_height <= 1:
+            return PREVIEW_SURFACE_MIN_WIDTH, PREVIEW_SURFACE_MIN_HEIGHT
+        return max(1, available_width), max(1, available_height)
+
     def _show_preview_video_widget(self, show_video: bool) -> None:
+        # Canvas と VLC 描画用 Frame は必ず同じ矩形に置く。位置がずれると
+        # 再生 / 一時停止のたびに映像が飛ぶ。
+        place_options = {
+            "x": self.preview_canvas_offset_x,
+            "y": self.preview_canvas_offset_y,
+            "width": max(1, self.preview_canvas_width),
+            "height": max(1, self.preview_canvas_height),
+        }
         if show_video:
             self.preview_canvas.place_forget()
-            self.preview_video_frame.place(x=0, y=0, width=self.preview_canvas_width, height=self.preview_canvas_height)
+            self.preview_video_frame.place(**place_options)
         else:
             self.preview_video_frame.place_forget()
-            self.preview_canvas.place(x=0, y=0, width=self.preview_canvas_width, height=self.preview_canvas_height)
+            self.preview_canvas.place(**place_options)
 
     def _ensure_preview_vlc(self) -> bool:
         if self.preview_vlc_player is not None:
@@ -1855,21 +2014,28 @@ class Insta360ExtractorApp:
             snapshot_path = Path(temporary.name)
 
         try:
-            result = self.preview_vlc_player.video_take_snapshot(
-                0,
-                str(snapshot_path),
-                self.preview_canvas_width,
-                self.preview_canvas_height,
-            )
+            snapshot_width = max(MIN_SNAPSHOT_SIZE, self.preview_canvas_width)
+            snapshot_height = max(MIN_SNAPSHOT_SIZE, self.preview_canvas_height)
+            try:
+                result = self.preview_vlc_player.video_take_snapshot(
+                    0,
+                    str(snapshot_path),
+                    snapshot_width,
+                    snapshot_height,
+                )
+            except Exception as error:
+                self._append_log(f"ERROR: プレビュー静止画の取得に失敗しました: {error}")
+                return
             if result != 0 or not snapshot_path.is_file():
-                snapshot_path.unlink(missing_ok=True)
                 return
 
-            pil_image = Image.open(snapshot_path)
             try:
-                self.preview_photo = ImageTk.PhotoImage(pil_image.copy())
-            finally:
-                pil_image.close()
+                with Image.open(snapshot_path) as pil_image:
+                    self.preview_photo = ImageTk.PhotoImage(pil_image.convert("RGB"))
+                self.preview_photo_from_snapshot = True
+            except Exception as error:
+                self._append_log(f"ERROR: プレビュー静止画の読み込みに失敗しました: {error}")
+                return
             self._show_preview_video_widget(False)
             self._render_preview_overlay()
         finally:
@@ -1946,6 +2112,7 @@ class Insta360ExtractorApp:
             duration_seconds = raw_frame_count / raw_fps
 
         self.preview_capture = capture
+        self.preview_mode = "proxy"
         self.preview_proxy_path = proxy_path
         self.preview_current_video_path = video_path
         self.preview_fps = raw_fps
@@ -1972,19 +2139,15 @@ class Insta360ExtractorApp:
         self.preview_capture = None
         self.preview_proxy_path = None
         self.preview_metadata = metadata
+        self.preview_mode = "vlc"
         self.preview_current_video_path = video_path
         self.preview_current_frame_index = 0
         self.preview_duration_seconds = metadata.duration_seconds or 0.0
         self.preview_fps = 30.0
         self.preview_total_frames = max(1, int(round(self.preview_duration_seconds * self.preview_fps)))
 
-        self._apply_preview_canvas_size(preview_width, preview_height)
         self._auto_resize_window_for_preview(preview_width, preview_height)
-        self.root.update_idletasks()
-        self._update_preview_canvas_layout(
-            max(1, self.preview_media_frame.winfo_width()),
-            max(1, self.preview_media_frame.winfo_height()),
-        )
+        self._layout_preview_surface()
 
         self.preview_slider_internal_update = True
         self.preview_seek_scale.configure(from_=0, to=max(self.preview_total_frames - 1, 1))
@@ -1994,18 +2157,73 @@ class Insta360ExtractorApp:
         self._set_preview_preparing_state(False)
         return True
 
-    def _read_initial_preview_frame(self, video_path: Path) -> object | None:
-        cv2 = get_cv2()
-        capture = cv2.VideoCapture(str(video_path))
+    def _read_initial_preview_frame(
+        self,
+        video_path: Path,
+        ffmpeg_path: str,
+        metadata: VideoMetadata,
+    ) -> object | None:
+        frame = self._read_initial_frame_with_cv2(video_path)
+        if frame is not None:
+            return frame
+        # .insv など OpenCV が開けない形式でもプレビューを出せるよう ffmpeg に退避する。
+        return self._read_initial_frame_with_ffmpeg(video_path, ffmpeg_path, metadata)
+
+    def _read_initial_frame_with_cv2(self, video_path: Path) -> object | None:
         try:
+            cv2 = get_cv2()
+        except Exception as error:
+            self._append_log(f"ERROR: OpenCV を読み込めませんでした: {error}")
+            return None
+
+        capture = None
+        try:
+            capture = cv2.VideoCapture(str(video_path))
             if not capture.isOpened():
                 return None
             success, frame = capture.read()
             if not success or frame is None:
                 return None
             return frame
+        except Exception:
+            return None
         finally:
-            capture.release()
+            if capture is not None:
+                capture.release()
+
+    def _read_initial_frame_with_ffmpeg(
+        self,
+        video_path: Path,
+        ffmpeg_path: str,
+        metadata: VideoMetadata,
+    ) -> object | None:
+        import numpy as np
+
+        target_width, target_height = fit_size_within_bounds(
+            metadata.width,
+            metadata.height,
+            *self._preview_surface_bounds(),
+            allow_upscale=False,
+        )
+        preview_path: Path | None = None
+        try:
+            preview_path = extract_preview_image(
+                video_path,
+                ffmpeg_path,
+                metadata,
+                target_width,
+                target_height,
+            )
+            with Image.open(preview_path) as pil_image:
+                rgb_array = np.asarray(pil_image.convert("RGB"))
+            # _display_preview_frame は BGR を前提にしているため並べ替える。
+            return rgb_array[:, :, ::-1].copy()
+        except Exception as error:
+            self._append_log(f"ERROR: ffmpeg でのサムネイル取得に失敗しました: {error}")
+            return None
+        finally:
+            if preview_path is not None:
+                preview_path.unlink(missing_ok=True)
 
     def _prepare_preview_proxy_async(
         self,
@@ -2074,26 +2292,39 @@ class Insta360ExtractorApp:
         )
 
     def _display_preview_frame(self, frame_bgr: object) -> None:
-        cv2 = get_cv2()
-        frame_array = frame_bgr
-        if getattr(frame_array, "shape", None) is not None:
-            frame_height, frame_width = frame_array.shape[:2]
-            if (frame_width, frame_height) != (self.preview_canvas_width, self.preview_canvas_height):
-                frame_array = cv2.resize(
-                    frame_array,
-                    (self.preview_canvas_width, self.preview_canvas_height),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-
-        frame_rgb = cv2.cvtColor(frame_array, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(frame_rgb)
-        self.preview_photo = ImageTk.PhotoImage(pil_image)
+        self.preview_last_frame_bgr = frame_bgr
+        self._update_preview_photo(frame_bgr)
 
         self.preview_slider_internal_update = True
         self.preview_seek_var.set(float(self.preview_current_frame_index))
         self.preview_slider_internal_update = False
         self._set_preview_time_for_current_frame()
         self._render_preview_overlay()
+
+    def _update_preview_photo(self, frame_bgr: object) -> None:
+        """BGR フレームを現在の Canvas サイズに合わせて PhotoImage 化する。"""
+        self.preview_photo_from_snapshot = False
+        target_width = max(1, self.preview_canvas_width)
+        target_height = max(1, self.preview_canvas_height)
+
+        try:
+            cv2 = get_cv2()
+            frame_array = frame_bgr
+            frame_shape = getattr(frame_array, "shape", None)
+            if frame_shape is not None:
+                frame_height, frame_width = frame_shape[:2]
+                if (frame_width, frame_height) != (target_width, target_height):
+                    frame_array = cv2.resize(
+                        frame_array,
+                        (target_width, target_height),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+            frame_rgb = cv2.cvtColor(frame_array, cv2.COLOR_BGR2RGB)
+            self.preview_photo = ImageTk.PhotoImage(Image.fromarray(frame_rgb))
+        except Exception as error:
+            # 極小サイズや壊れたフレームでもプレビュー全体を落とさない。
+            self.preview_photo = None
+            self._append_log(f"ERROR: プレビュー描画に失敗しました: {error}")
 
     def _render_preview_frame(self, frame_index: int, sequential: bool = False) -> bool:
         frame = self._read_preview_frame(frame_index, sequential=sequential)
@@ -2220,10 +2451,8 @@ class Insta360ExtractorApp:
         self._cancel_preview_seek()
         self._render_preview_frame(frame_index, sequential=False)
 
-    def _on_sphere_canvas_configure(self, event: tk.Event[tk.Misc]) -> None:
-        canvas_width = max(1, int(event.width))
-        canvas_height = max(1, int(event.height))
-        self.sphere_canvas_size = min(canvas_width, canvas_height)
+    def _on_sphere_canvas_configure(self, _event: tk.Event[tk.Misc]) -> None:
+        # 描画側が winfo_width/height を直接読むので、ここでは再描画のみ行う。
         self._render_direction_sphere()
 
     def _on_sphere_drag_start(self, event: tk.Event[tk.Misc]) -> None:
@@ -2502,37 +2731,43 @@ class Insta360ExtractorApp:
         self._close_preview_capture()
         self._set_preview_preparing_state(False)
         self.preview_photo = None
+        self.preview_photo_from_snapshot = False
+        self.preview_last_frame_bgr = None
         self.preview_metadata = None
         self.preview_box = None
         self._cleanup_preview_file()
         self._reset_preview_controls()
         self.preview_info_var.set(info_text)
         self.preview_selection_var.set("方向を選択すると強調表示されます。")
-        self._render_preview_overlay()
+        self._layout_preview_surface()
         self._render_direction_sphere()
 
     def _determine_preview_canvas_size(self, metadata: VideoMetadata) -> tuple[int, int]:
+        """ウィンドウを画面いっぱいまで広げた場合に確保できるプレビューサイズ。
+
+        戻り値はウィンドウ拡大の希望値であり、実際の描画サイズは
+        `_layout_preview_surface` が常に実測値から決める。
+        """
         self.root.update_idletasks()
 
-        current_window_width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
-        current_window_height = max(self.root.winfo_height(), self.root.winfo_reqheight())
-        current_media_width = max(self.preview_media_frame.winfo_width(), self.preview_canvas_width)
-        current_media_height = max(self.preview_media_frame.winfo_height(), self.preview_canvas_height)
+        current_window_width = max(self.root.winfo_width(), self.min_window_width)
+        current_window_height = max(self.root.winfo_height(), self.min_window_height)
+        media_width, media_height = self._preview_surface_bounds()
 
-        non_preview_width = max(0, current_window_width - current_media_width)
-        non_preview_height = max(0, current_window_height - current_media_height)
+        non_preview_width = max(0, current_window_width - media_width)
+        non_preview_height = max(0, current_window_height - media_height)
 
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        max_window_width = max(self.min_window_width, int(screen_width * 0.94))
-        max_window_height = max(self.min_window_height, int(screen_height * 0.88))
+        max_window_width = max(self.min_window_width, int(screen_width * WINDOW_MAX_SCREEN_WIDTH_RATIO))
+        max_window_height = max(self.min_window_height, int(screen_height * WINDOW_MAX_SCREEN_HEIGHT_RATIO))
 
         max_preview_width = max(
-            MIN_PREVIEW_CANVAS_WIDTH,
+            PREVIEW_SURFACE_MIN_WIDTH,
             max_window_width - non_preview_width,
         )
         max_preview_height = max(
-            MIN_PREVIEW_CANVAS_HEIGHT,
+            PREVIEW_SURFACE_MIN_HEIGHT,
             max_window_height - non_preview_height,
         )
 
@@ -2544,51 +2779,59 @@ class Insta360ExtractorApp:
             allow_upscale=True,
         )
 
-    def _apply_preview_canvas_size(self, canvas_width: int, canvas_height: int) -> None:
-        self.preview_canvas_width = canvas_width
-        self.preview_canvas_height = canvas_height
-        self.preview_canvas.place(x=0, y=0, width=canvas_width, height=canvas_height)
-
     def _auto_resize_window_for_preview(self, canvas_width: int, canvas_height: int) -> None:
+        """動画が入るようウィンドウを広げる。縮小はせず、画面と最小サイズを必ず守る。"""
         self.root.update_idletasks()
 
-        current_window_width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
-        current_window_height = max(self.root.winfo_height(), self.root.winfo_reqheight())
-        current_canvas_width = max(self.preview_canvas.winfo_width(), canvas_width)
-        current_canvas_height = max(self.preview_canvas.winfo_height(), canvas_height)
+        current_window_width = max(self.root.winfo_width(), self.min_window_width)
+        current_window_height = max(self.root.winfo_height(), self.min_window_height)
+        media_width, media_height = self._preview_surface_bounds()
 
-        non_preview_width = max(0, current_window_width - current_canvas_width)
-        non_preview_height = max(0, current_window_height - current_canvas_height)
+        non_preview_width = max(0, current_window_width - media_width)
+        non_preview_height = max(0, current_window_height - media_height)
 
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        target_window_width = max(
-            self.min_window_width,
-            min(int(screen_width * 0.96), non_preview_width + canvas_width),
+        max_window_width = max(self.min_window_width, int(screen_width * WINDOW_MAX_SCREEN_WIDTH_RATIO))
+        max_window_height = max(self.min_window_height, int(screen_height * WINDOW_MAX_SCREEN_HEIGHT_RATIO))
+
+        target_window_width = min(
+            max_window_width,
+            max(self.min_window_width, current_window_width, non_preview_width + canvas_width),
         )
-        target_window_height = max(
-            self.min_window_height,
-            min(int(screen_height * 0.92), non_preview_height + canvas_height),
+        target_window_height = min(
+            max_window_height,
+            max(self.min_window_height, current_window_height, non_preview_height + canvas_height),
         )
+
+        if target_window_width <= current_window_width and target_window_height <= current_window_height:
+            return
 
         window_x = max(0, self.root.winfo_x())
         window_y = max(0, self.root.winfo_y())
         self.root.geometry(f"{target_window_width}x{target_window_height}+{window_x}+{window_y}")
+        self.root.update_idletasks()
 
-    def _update_preview_canvas_layout(self, available_width: int, available_height: int) -> None:
+    def _layout_preview_surface(self) -> None:
+        """プレビュー面を常に表示領域内へ収める。
+
+        動画の有無・ウィンドウサイズ・再生方式にかかわらずここだけがサイズを決めるので、
+        どのタイミングで呼んでもレイアウトが壊れない。
+        """
+        available_width, available_height = self._preview_surface_bounds()
+
         if self.preview_metadata is None:
-            return
+            # 動画未選択時は領域全体を使い、案内テキストが必ず見えるようにする。
+            target_width, target_height = available_width, available_height
+        else:
+            target_width, target_height = fit_size_within_bounds(
+                self.preview_metadata.width,
+                self.preview_metadata.height,
+                available_width,
+                available_height,
+                allow_upscale=True,
+            )
 
-        target_width, target_height = fit_size_within_bounds(
-            self.preview_metadata.width,
-            self.preview_metadata.height,
-            max(1, available_width),
-            max(1, available_height),
-            allow_upscale=True,
-        )
-
-        offset_x = max(0, (available_width - target_width) // 2)
-        offset_y = max(0, (available_height - target_height) // 2)
         size_changed = (
             target_width != self.preview_canvas_width
             or target_height != self.preview_canvas_height
@@ -2596,34 +2839,40 @@ class Insta360ExtractorApp:
 
         self.preview_canvas_width = target_width
         self.preview_canvas_height = target_height
-        self.preview_canvas.place(x=offset_x, y=offset_y, width=target_width, height=target_height)
-        self.preview_box = compute_preview_box(
-            self.preview_metadata.width,
-            self.preview_metadata.height,
-            target_width,
-            target_height,
-        )
+        self.preview_canvas_offset_x = max(0, (available_width - target_width) // 2)
+        self.preview_canvas_offset_y = max(0, (available_height - target_height) // 2)
+        self._show_preview_video_widget(self._preview_uses_vlc() and self.preview_is_playing)
 
-        if size_changed and self.preview_capture is not None:
-            self._render_preview_frame(self.preview_current_frame_index, sequential=False)
-        else:
-            self._render_preview_overlay()
-
-    def _on_preview_media_configure(self, event: tk.Event[tk.Misc]) -> None:
         if self.preview_metadata is None:
-            return
+            self.preview_box = None
+        else:
+            self.preview_box = compute_preview_box(
+                self.preview_metadata.width,
+                self.preview_metadata.height,
+                target_width,
+                target_height,
+            )
 
+        if size_changed:
+            if self.preview_photo_from_snapshot and self._preview_uses_vlc() and not self.preview_is_playing:
+                # VLC の静止画は現在位置のものを取り直す (拡大された古い画像を残さない)。
+                self._schedule_preview_snapshot(120)
+            elif self.preview_last_frame_bgr is not None:
+                # 表示済みフレームを新しいサイズで再生成する (再シークしない)。
+                self._update_preview_photo(self.preview_last_frame_bgr)
+        self._render_preview_overlay()
+
+    def _on_preview_media_configure(self, _event: tk.Event[tk.Misc]) -> None:
+        # 動画の有無に関係なく追従させる。metadata が無い間もサイズを合わせないと
+        # 案内テキストが表示領域外に描かれてしまう。
         if self.preview_resize_after_id is not None:
             self.root.after_cancel(self.preview_resize_after_id)
 
-        available_width = int(event.width)
-        available_height = int(event.height)
-
         def apply_resize() -> None:
             self.preview_resize_after_id = None
-            self._update_preview_canvas_layout(available_width, available_height)
+            self._layout_preview_surface()
 
-        self.preview_resize_after_id = self.root.after(10, apply_resize)
+        self.preview_resize_after_id = self.root.after(30, apply_resize)
 
     def _load_preview_for_current_input(self, show_errors: bool = True) -> None:
         input_value = self.input_path_var.get().strip()
@@ -2657,7 +2906,7 @@ class Insta360ExtractorApp:
         try:
             metadata = probe_video_metadata(input_video, ffprobe_path)
             preview_canvas_width, preview_canvas_height = self._determine_preview_canvas_size(metadata)
-            initial_frame = self._read_initial_preview_frame(input_video)
+            initial_frame = self._read_initial_preview_frame(input_video, ffmpeg_path, metadata)
         except Exception as error:
             self._clear_preview("プレビューの読み込みに失敗しました。")
             self._append_log(f"ERROR: {error}")
@@ -2668,6 +2917,7 @@ class Insta360ExtractorApp:
 
         if initial_frame is None:
             self._clear_preview("動画フレームの読み込みに失敗しました。")
+            self.status_var.set("プレビューの読み込みに失敗しました。")
             if show_errors:
                 messagebox.showerror("プレビューエラー", "動画フレームの読み込みに失敗しました。")
             return
@@ -2683,17 +2933,14 @@ class Insta360ExtractorApp:
                 preview_canvas_height,
             )
         if not fast_player_ready:
+            # VLC を使わないモードでは必ず映像ウィジェットを隠し、Canvas 側に戻す。
+            self.preview_mode = "proxy"
             self.preview_total_frames = max(1, int(round((metadata.duration_seconds or 0.0) * PREVIEW_PROXY_FPS_LIMIT)))
             self.preview_duration_seconds = metadata.duration_seconds or 0.0
             self.preview_fps = PREVIEW_PROXY_FPS_LIMIT
             self.preview_current_frame_index = 0
-            self._apply_preview_canvas_size(preview_canvas_width, preview_canvas_height)
             self._auto_resize_window_for_preview(preview_canvas_width, preview_canvas_height)
-            self.root.update_idletasks()
-            self._update_preview_canvas_layout(
-                max(1, self.preview_media_frame.winfo_width()),
-                max(1, self.preview_media_frame.winfo_height()),
-            )
+            self._layout_preview_surface()
             self.preview_slider_internal_update = True
             self.preview_seek_scale.configure(from_=0, to=max(self.preview_total_frames - 1, 1))
             self.preview_seek_var.set(0.0)
@@ -2794,6 +3041,15 @@ class Insta360ExtractorApp:
         self._refresh_direction_table(select_index=selected_index)
         self.status_var.set(f"方向 {selected_index} を更新しました。")
 
+    def _replace_directions(self, directions: list[Direction]) -> None:
+        """方向リストを中身ごと差し替える。
+
+        `self.directions` は現在の DirectionSet が持つリストと同一オブジェクトなので、
+        再代入すると参照が切れてセット側に反映されず、保存やタブ切り替えで編集が失われる。
+        必ずスライス代入で中身だけを入れ替える。
+        """
+        self.directions[:] = directions
+
     def _remove_selected_direction(self) -> None:
         selected_index = self._selected_direction_index()
         if selected_index is None:
@@ -2802,7 +3058,7 @@ class Insta360ExtractorApp:
 
         del self.directions[selected_index]
         if not self.directions:
-            self.directions = [Direction(yaw=0.0, pitch=0.0)]
+            self._replace_directions([Direction(yaw=0.0, pitch=0.0)])
             next_index = 0
         else:
             next_index = min(selected_index, len(self.directions) - 1)
@@ -2811,7 +3067,7 @@ class Insta360ExtractorApp:
         self.status_var.set(f"方向を削除しました。現在 {len(self.directions)} 件です。")
 
     def _clear_directions(self) -> None:
-        self.directions = [Direction(yaw=0.0, pitch=0.0)]
+        self._replace_directions([Direction(yaw=0.0, pitch=0.0)])
         self.yaw_var.set("0")
         self.pitch_var.set("0")
         self._refresh_direction_table(select_index=0)
@@ -2825,7 +3081,7 @@ class Insta360ExtractorApp:
             messagebox.showerror("入力エラー", str(error))
             return
 
-        self.directions = generate_ring_directions(count, pitch)
+        self._replace_directions(generate_ring_directions(count, pitch))
         self._refresh_direction_table(select_index=0)
         self.status_var.set(f"水平リング {count} 方向で置き換えました。")
 
@@ -2874,6 +3130,8 @@ class Insta360ExtractorApp:
                 fill="#cbd5e1",
                 font=("Yu Gothic UI", 13),
                 justify="center",
+                # 幅を渡して折り返す。狭いウィンドウでも文字が枠外へ出ない。
+                width=max(80, self.preview_canvas_width - 32),
             )
             return
 
@@ -3083,9 +3341,8 @@ class Insta360ExtractorApp:
         assert isinstance(output_dir, Path)
         assert isinstance(video_stem, str | None)
 
-        if run_extract:
-            pattern = f"{video_stem}_*.jpg" if video_stem else "*.jpg"
-            existing = list(output_dir.glob(pattern))
+        if run_extract and output_dir.is_dir():
+            existing = list(output_dir.glob(build_extracted_image_glob(video_stem)))
             if existing and not messagebox.askyesno(
                 "上書き確認",
                 f"{len(existing)} 件の既存画像が見つかりました。上書きして続行しますか？",
@@ -3094,7 +3351,9 @@ class Insta360ExtractorApp:
 
         self.stop_requested.clear()
         self._append_log("=== 抽出を開始します ===")
-        parallelism = min(int(options["parallelism"]), len(self.directions)) if run_extract else 0
+        planned_directions = options["directions"]
+        assert isinstance(planned_directions, list)
+        parallelism = min(int(options["parallelism"]), len(planned_directions)) if run_extract else 0
         gpu_text = "CUDA ON" if bool(options["use_gpu_decode"]) else "CUDA OFF"
         reverse_text = "逆再生 ON" if bool(options["reverse_video"]) else "逆再生 OFF"
         mode_text = (
@@ -3154,7 +3413,9 @@ class Insta360ExtractorApp:
         width = parse_positive_int(self.width_var.get().strip(), "幅")
         height = parse_positive_int(self.height_var.get().strip(), "高さ")
         parallelism = parse_positive_int(self.parallelism_var.get().strip(), "並列数")
-        mask_parallelism = parse_positive_int(self.mask_parallelism_var.get().strip(), "マスク並列数")
+        mask_parallelism = parse_positive_int(self.mask_parallelism_var.get().strip(), "マスクバッチ数")
+        if mask_parallelism > MASK_BATCH_SIZE_LIMIT:
+            raise ValueError(f"マスクバッチ数は1から{MASK_BATCH_SIZE_LIMIT}の範囲で指定してください。")
         reverse_direction_index_on_odd = bool(self.reverse_direction_index_on_odd_var.get())
         mask_confidence_threshold = parse_probability_threshold(
             self.mask_confidence_threshold_var.get().strip(),
@@ -3170,10 +3431,11 @@ class Insta360ExtractorApp:
             raise ValueError("ffmpeg が見つかりません。PATH に追加してから実行してください。")
         self.ffmpeg_path = ffmpeg_path
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-
         if run_masks and not mask_categories:
             raise ValueError("マスク対象を少なくとも1つ選択してください。")
+
+        # 出力フォルダの作成は実処理側で行う。
+        # ここで作ると入力エラーや上書き確認のキャンセル時に空フォルダが残る。
 
         video_stem = input_video.stem if input_video is not None else None
         return {
@@ -3243,6 +3505,7 @@ class Insta360ExtractorApp:
         assert isinstance(mask_categories, list)
 
         try:
+            output_dir.mkdir(parents=True, exist_ok=True)
             total = len(directions)
             parallelism = max(1, min(requested_parallelism, total)) if run_extract else 0
             mask_parallelism = max(1, requested_mask_parallelism)
@@ -3594,20 +3857,23 @@ class Insta360ExtractorApp:
             while True:
                 kind, message = self.log_queue.get_nowait()
                 if kind == "log":
-                    self._append_log(message)
+                    self._append_log(str(message))
                 elif kind == "status":
-                    self._append_log(message)
-                    self.status_var.set(message)
-                    if message == "完了しました。":
+                    status_text = str(message)
+                    self._append_log(status_text)
+                    self.status_var.set(status_text)
+                    if status_text == "完了しました。":
                         messagebox.showinfo("完了", "画像書き出しが完了しました。")
-                    elif message == "停止しました。":
+                    elif status_text == "停止しました。":
                         messagebox.showinfo("停止", "処理を停止しました。")
                 elif kind == "error":
-                    self._append_log(f"ERROR: {message}")
+                    error_message = str(message)
+                    self._append_log(f"ERROR: {error_message}")
                     self.status_var.set("エラーが発生しました。")
-                    messagebox.showerror("エラー", message)
+                    messagebox.showerror("エラー", error_message)
                 elif kind == "preview_proxy_ready":
-                    assert isinstance(message, dict)
+                    if not isinstance(message, dict):
+                        continue
                     request_id = message.get("request_id")
                     proxy_path = message.get("proxy_path")
                     video_path = message.get("video_path")
@@ -3620,6 +3886,8 @@ class Insta360ExtractorApp:
                         continue
                     try:
                         self._open_preview_capture(proxy_path, video_path, metadata)
+                        self._layout_preview_surface()
+                        self._render_preview_frame(0, sequential=False)
                         self._set_preview_preparing_state(False)
                         self.status_var.set("プレビューを更新しました。")
                     except Exception as error:
@@ -3627,7 +3895,8 @@ class Insta360ExtractorApp:
                         self._set_preview_preparing_state(False)
                         self.status_var.set("軽量プレビューの準備に失敗しました。")
                 elif kind == "preview_proxy_error":
-                    assert isinstance(message, dict)
+                    if not isinstance(message, dict):
+                        continue
                     request_id = message.get("request_id")
                     error_text = message.get("error")
                     if request_id != self.preview_proxy_request_id:
@@ -3639,7 +3908,7 @@ class Insta360ExtractorApp:
         except queue.Empty:
             pass
         finally:
-            self.root.after(100, self._drain_log_queue)
+            self.log_drain_after_id = self.root.after(100, self._drain_log_queue)
 
     def _append_log(self, message: str) -> None:
         self.log_text.configure(state="normal")
@@ -3665,8 +3934,26 @@ class Insta360ExtractorApp:
 
         self._pause_preview_playback()
         self._close_preview_capture()
+        self._release_preview_vlc()
         self._cleanup_preview_file()
+        self._cancel_pending_callbacks()
         self.root.destroy()
+
+    def _cancel_pending_callbacks(self) -> None:
+        """破棄後に after コールバックが走らないようにまとめて解除する。"""
+        self._cancel_preview_playback()
+        self._cancel_preview_seek()
+        self._cancel_preview_vlc_poll()
+        self._cancel_preview_snapshot()
+        for attribute in ("log_drain_after_id", "preview_resize_after_id"):
+            after_id = getattr(self, attribute, None)
+            if after_id is None:
+                continue
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+            setattr(self, attribute, None)
 
 
 def main() -> None:

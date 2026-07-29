@@ -1,22 +1,30 @@
+import math
 import tempfile
 import tkinter
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree
 
 from insta360_frame_extractor_gui import (
     Direction,
     DirectionSet,
     build_extracted_image_glob,
+    build_filter,
     build_footprint_segments,
     build_ffmpeg_command,
     build_mask_output_path,
     build_overlapping_tile_regions,
     build_output_image_path,
     build_output_pattern,
+    build_single_pass_ffmpeg_command,
+    build_single_pass_filter_complex,
     build_tile_starts,
+    build_xmp_document,
+    build_xmp_sidecar_path,
     build_binary_usage_mask,
     collect_segformer_excluded_label_groups,
     collect_segformer_excluded_label_ids,
+    compute_focal_length_35mm,
     compute_output_direction_index,
     compute_vertical_fov,
     compute_preview_box,
@@ -29,6 +37,119 @@ from insta360_frame_extractor_gui import (
     parse_probability_threshold,
     resolve_mask_detail_preset,
 )
+
+
+class SinglePassExtractionTests(unittest.TestCase):
+    directions = [Direction(yaw=0.0, pitch=0.0), Direction(yaw=90.0, pitch=-10.0)]
+
+    def test_single_pass_decodes_input_once_for_every_direction(self) -> None:
+        command = build_single_pass_ffmpeg_command(
+            ffmpeg_path="ffmpeg",
+            input_video=Path("C:/in/clip.mp4"),
+            output_patterns=[Path("C:/tmp/0/%04d.jpg"), Path("C:/tmp/1/%04d.jpg")],
+            directions=self.directions,
+            fps=1.0,
+            fov=90.0,
+            width=1920,
+            height=1080,
+        )
+        self.assertEqual(command.count("-i"), 1)
+        self.assertEqual(command.count("-map"), len(self.directions))
+        self.assertEqual(command.count("-filter_complex"), 1)
+
+    def test_single_pass_filter_complex_splits_after_the_shared_fps_stage(self) -> None:
+        filter_complex, labels = build_single_pass_filter_complex(
+            self.directions,
+            fps=2.0,
+            fov=90.0,
+            width=1920,
+            height=1440,
+            use_gpu_decode=False,
+        )
+        self.assertEqual(labels, ["o0", "o1"])
+        # fps は分岐前に 1 度だけ適用され、以降は方向ごとの v360 だけが走る。
+        self.assertEqual(filter_complex.count("fps=2"), 1)
+        self.assertEqual(filter_complex.count("v360="), len(self.directions))
+        self.assertIn("split=2[s0][s1]", filter_complex)
+
+    def test_single_pass_branches_match_the_per_direction_filter(self) -> None:
+        # 1 パス化しても各方向に適用される変換は従来と同一でなければならない。
+        filter_complex, _ = build_single_pass_filter_complex(
+            self.directions,
+            fps=1.0,
+            fov=90.0,
+            width=1920,
+            height=1080,
+            use_gpu_decode=False,
+        )
+        for index, direction in enumerate(self.directions):
+            reference = build_filter(direction, 1.0, 90.0, 1920, 1080)
+            v360_stage = reference.split(",", 1)[1]
+            self.assertIn(f"[s{index}]{v360_stage}[o{index}]", filter_complex)
+
+    def test_single_pass_downloads_gpu_frames_before_splitting(self) -> None:
+        filter_complex, _ = build_single_pass_filter_complex(
+            self.directions,
+            fps=1.0,
+            fov=90.0,
+            width=1920,
+            height=1080,
+            use_gpu_decode=True,
+        )
+        self.assertTrue(filter_complex.startswith("[0:v]hwdownload,format=nv12,fps="))
+
+    def test_single_pass_rejects_mismatched_output_patterns(self) -> None:
+        with self.assertRaises(ValueError):
+            build_single_pass_ffmpeg_command(
+                ffmpeg_path="ffmpeg",
+                input_video=Path("C:/in/clip.mp4"),
+                output_patterns=[Path("C:/tmp/0/%04d.jpg")],
+                directions=self.directions,
+                fps=1.0,
+                fov=90.0,
+                width=1920,
+                height=1080,
+            )
+
+
+class RealityScanXmpTests(unittest.TestCase):
+    def test_focal_length_35mm_matches_the_requested_horizontal_fov(self) -> None:
+        # h_fov 90 度なら f = (w/2)/tan(45) = w/2 → 長辺基準で 36 * 0.5 = 18mm。
+        self.assertAlmostEqual(compute_focal_length_35mm(90.0, 1920, 1080), 18.0, places=9)
+        # 画角を半分にすると焦点距離はほぼ倍になる。
+        self.assertAlmostEqual(compute_focal_length_35mm(45.0, 1920, 1080), 18.0 / math.tan(math.radians(22.5)), places=9)
+
+    def test_focal_length_35mm_normalises_by_the_longer_edge(self) -> None:
+        landscape = compute_focal_length_35mm(90.0, 1920, 1080)
+        square = compute_focal_length_35mm(90.0, 1080, 1080)
+        self.assertAlmostEqual(landscape, square, places=9)
+
+    def test_sidecar_path_replaces_the_image_extension(self) -> None:
+        sidecar = build_xmp_sidecar_path(Path("C:/output/clip_0000_00.jpg"))
+        self.assertEqual(str(sidecar).replace("\\", "/"), "C:/output/clip_0000_00.xmp")
+
+    def test_xmp_document_declares_the_capturing_reality_namespace(self) -> None:
+        document = build_xmp_document(18.0)
+        self.assertIn('xmlns:xcr="http://www.capturingreality.com/ns/xcr/1.1#"', document)
+        self.assertIn('xcr:FocalLength35mm="18.000000000"', document)
+        self.assertIn('xcr:DistortionModel="division"', document)
+
+    def test_xmp_document_shares_one_calibration_group_across_images(self) -> None:
+        # 全画像が同一の合成カメラなので、キャリブレーションは 1 グループにまとめる。
+        first = build_xmp_document(18.0, calibration_group=0, distortion_group=0)
+        second = build_xmp_document(18.0, calibration_group=0, distortion_group=0)
+        self.assertEqual(first, second)
+        self.assertIn('xcr:CalibrationGroup="0"', first)
+        self.assertIn('xcr:DistortionGroup="0"', first)
+
+    def test_xmp_document_omits_unverified_pose_priors(self) -> None:
+        # 回転行列の座標系規約を実機確認できていないため、姿勢は書き出さない。
+        document = build_xmp_document(18.0)
+        self.assertNotIn("xcr:Rotation", document)
+        self.assertNotIn("xcr:Position", document)
+
+    def test_xmp_document_is_well_formed_xml(self) -> None:
+        ElementTree.fromstring(build_xmp_document(18.0))
 
 
 class Insta360FrameExtractorGuiTests(unittest.TestCase):

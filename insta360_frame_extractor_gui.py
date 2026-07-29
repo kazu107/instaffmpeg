@@ -444,6 +444,182 @@ def build_ffmpeg_command(
     return command
 
 
+def compute_focal_length_35mm(horizontal_fov: float, width: int, height: int) -> float:
+    """v360 の flat 出力に対応する 35mm 換算焦点距離を返す。
+
+    v360 の flat 出力は理想ピンホール投影そのもので、レンズ歪みが無く、主点は画像中心、
+    画素は正方 (`compute_vertical_fov` が水平画角とアスペクト比から v_fov を導くため
+    fx == fy になる)。したがって焦点距離は推定するまでもなく水平画角から厳密に決まる。
+
+    RealityScan / RealityCapture は 35mm 換算焦点距離を画像の長辺基準で扱うため、
+    f_px = (width / 2) / tan(h_fov / 2) を長辺で正規化して 36mm を掛ける。
+    """
+    half_angle = math.tan(math.radians(horizontal_fov) / 2.0)
+    if half_angle <= 0.0:
+        raise ValueError("画角は 0 度より大きく 180 度未満で指定してください。")
+    focal_length_pixels = (width / 2.0) / half_angle
+    return 36.0 * focal_length_pixels / max(width, height)
+
+
+def build_xmp_sidecar_path(image_path: Path) -> Path:
+    """RealityScan は `<画像名>.xmp` を同じフォルダから読み込む。"""
+    return image_path.with_suffix(".xmp")
+
+
+def build_xmp_document(
+    focal_length_35mm: float,
+    calibration_group: int = 0,
+    distortion_group: int = 0,
+    in_texturing: bool = True,
+    in_meshing: bool = True,
+) -> str:
+    """RealityScan / RealityCapture 用の XMP サイドカーを組み立てる。
+
+    姿勢 (Rotation / Position) は書かない。回転行列の座標系規約を実機で確認できていないため、
+    誤った姿勢事前情報はアライメントを助けるどころか破壊しうる。
+    一方でキャリブレーションは v360 の出力仕様から厳密に確定するので、そこだけを渡す。
+
+    `CalibrationGroup` / `DistortionGroup` を全画像で共有させることで、
+    「これらは全て同一の合成カメラで撮られた」と RealityScan に伝えられる。
+    これによりキャリブレーションの推定が 1 グループに集約され、収束が速く安定する。
+    """
+    return (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">\n'
+        '  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+        '    <rdf:Description xmlns:xcr="http://www.capturingreality.com/ns/xcr/1.1#"\n'
+        '      xcr:Version="2"\n'
+        '      xcr:DistortionModel="division"\n'
+        f'      xcr:FocalLength35mm="{focal_length_35mm:.9f}"\n'
+        '      xcr:CalibrationPrior="initial"\n'
+        f'      xcr:CalibrationGroup="{calibration_group}"\n'
+        f'      xcr:DistortionGroup="{distortion_group}"\n'
+        f'      xcr:InTexturing="{1 if in_texturing else 0}"\n'
+        f'      xcr:InMeshing="{1 if in_meshing else 0}"/>\n'
+        '  </rdf:RDF>\n'
+        '</x:xmpmeta>\n'
+    )
+
+
+def write_xmp_sidecar(
+    image_path: Path,
+    focal_length_35mm: float,
+    calibration_group: int = 0,
+    distortion_group: int = 0,
+) -> Path:
+    sidecar_path = build_xmp_sidecar_path(image_path)
+    sidecar_path.write_text(
+        build_xmp_document(
+            focal_length_35mm,
+            calibration_group=calibration_group,
+            distortion_group=distortion_group,
+        ),
+        encoding="utf-8",
+    )
+    return sidecar_path
+
+
+def build_single_pass_filter_complex(
+    directions: list[Direction],
+    fps: float,
+    fov: float,
+    width: int,
+    height: int,
+    use_gpu_decode: bool,
+    reverse_video: bool = False,
+) -> tuple[str, list[str]]:
+    """全方向を1回のデコードで切り出す filter_complex を組み立てる。
+
+    方向ごとに ffmpeg を起動すると、方向数だけ入力動画を丸ごとデコードし直すことになる。
+    デコードは v360 変換より遥かに重いため、`split` で分岐して 1 パスにまとめる。
+    出力画素は方向ごとに起動した場合とバイト単位で一致する。
+    """
+    if not directions:
+        raise ValueError("方向が指定されていません。")
+
+    vertical_fov = compute_vertical_fov(fov, width, height)
+    output_labels = [f"o{index}" for index in range(len(directions))]
+    split_labels = "".join(f"[s{index}]" for index in range(len(directions)))
+
+    head = "[0:v]"
+    if use_gpu_decode:
+        head += "hwdownload,format=nv12,"
+    head += f"fps={direction_aware_float(fps)},"
+    if reverse_video:
+        head += "reverse,"
+    head += f"split={len(directions)}{split_labels}"
+
+    branches = [
+        (
+            "[s{index}]v360=input=equirect:output=flat:interp=cubic:w={width}:h={height}:"
+            "h_fov={fov}:v_fov={v_fov}:yaw={yaw}:pitch={pitch},setsar=1[{label}]"
+        ).format(
+            index=index,
+            width=width,
+            height=height,
+            fov=direction_aware_float(fov),
+            v_fov=direction_aware_float(vertical_fov),
+            yaw=direction_aware_float(direction.yaw),
+            pitch=direction_aware_float(direction.pitch),
+            label=output_labels[index],
+        )
+        for index, direction in enumerate(directions)
+    ]
+
+    return ";".join([head, *branches]), output_labels
+
+
+def build_single_pass_ffmpeg_command(
+    ffmpeg_path: str,
+    input_video: Path,
+    output_patterns: list[Path],
+    directions: list[Direction],
+    fps: float,
+    fov: float,
+    width: int,
+    height: int,
+    use_gpu_decode: bool = False,
+    reverse_video: bool = False,
+) -> list[str]:
+    if len(output_patterns) != len(directions):
+        raise ValueError("出力パターン数と方向数が一致しません。")
+
+    filter_complex, output_labels = build_single_pass_filter_complex(
+        directions,
+        fps,
+        fov,
+        width,
+        height,
+        use_gpu_decode,
+        reverse_video=reverse_video,
+    )
+
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-y",
+    ]
+
+    if use_gpu_decode:
+        command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+
+    command.extend(["-i", str(input_video), "-an", "-filter_complex", filter_complex])
+
+    for label, output_pattern in zip(output_labels, output_patterns):
+        command.extend(
+            [
+                "-map",
+                f"[{label}]",
+                "-q:v",
+                "2",
+                "-start_number",
+                "0",
+                str(output_pattern),
+            ]
+        )
+
+    return command
+
+
 def generate_ring_directions(count: int, pitch: float) -> list[Direction]:
     return [Direction(yaw=normalize_angle(index * 360.0 / count), pitch=pitch) for index in range(count)]
 
@@ -1095,6 +1271,8 @@ class Insta360ExtractorApp:
         self.run_extract_var = tk.BooleanVar(value=True)
         self.use_gpu_var = tk.BooleanVar(value=self.cuda_available)
         self.reverse_var = tk.BooleanVar(value=False)
+        self.single_pass_var = tk.BooleanVar(value=True)
+        self.write_xmp_var = tk.BooleanVar(value=False)
         self.reverse_direction_index_on_odd_var = tk.BooleanVar(value=False)
         self.generate_masks_var = tk.BooleanVar(value=False)
         self.mask_detail_level_var = tk.StringVar(value=DEFAULT_MASK_DETAIL_LEVEL)
@@ -1330,6 +1508,27 @@ class Insta360ExtractorApp:
             settings_frame,
             text="mask は `元画像.jpg.mask.png` / 白=使用, 黒=除外",
         ).grid(row=4, column=0, columnspan=SETTINGS_COLUMN_COUNT, sticky="w", pady=(6, 0))
+
+        settings_label("抽出", 5, 0)
+        single_pass_group = settings_group(5, 1, columnspan=SETTINGS_COLUMN_COUNT - 1)
+        ttk.Checkbutton(
+            single_pass_group,
+            text="単一デコードで全方向を抽出",
+            variable=self.single_pass_var,
+        ).pack(side="left")
+        ttk.Label(
+            single_pass_group,
+            text="入力のデコードを方向数回から1回に減らします",
+        ).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            single_pass_group,
+            text="RealityScan用XMPを書き出す",
+            variable=self.write_xmp_var,
+        ).pack(side="left", padx=(24, 0))
+        ttk.Label(
+            single_pass_group,
+            text="焦点距離と歪みゼロを事前情報として渡します",
+        ).pack(side="left", padx=(12, 0))
 
         # 実行ボタンを含む操作バーを先に下端へ固定する。
         # workspace より後に pack すると縦幅が足りない時に潰れて見えなくなる。
@@ -1607,6 +1806,8 @@ class Insta360ExtractorApp:
             "run_extract": bool(self.run_extract_var.get()),
             "use_gpu": bool(self.use_gpu_var.get()),
             "reverse": bool(self.reverse_var.get()),
+            "single_pass": bool(self.single_pass_var.get()),
+            "write_xmp": bool(self.write_xmp_var.get()),
             "reverse_direction_index_on_odd": bool(self.reverse_direction_index_on_odd_var.get()),
             "generate_masks": bool(self.generate_masks_var.get()),
             "mask_detail_level": self.mask_detail_level_var.get().strip(),
@@ -1692,6 +1893,14 @@ class Insta360ExtractorApp:
         saved_run_extract = payload.get("run_extract")
         if isinstance(saved_run_extract, bool):
             self.run_extract_var.set(saved_run_extract)
+
+        saved_single_pass = payload.get("single_pass")
+        if isinstance(saved_single_pass, bool):
+            self.single_pass_var.set(saved_single_pass)
+
+        saved_write_xmp = payload.get("write_xmp")
+        if isinstance(saved_write_xmp, bool):
+            self.write_xmp_var.set(saved_write_xmp)
 
         saved_reverse = payload.get("reverse")
         if isinstance(saved_reverse, bool):
@@ -3454,6 +3663,8 @@ class Insta360ExtractorApp:
             "run_masks": run_masks,
             "use_gpu_decode": bool(self.use_gpu_var.get() and self.cuda_available),
             "reverse_video": bool(self.reverse_var.get()),
+            "single_pass": bool(self.single_pass_var.get()),
+            "write_xmp": bool(self.write_xmp_var.get()),
             "reverse_direction_index_on_odd": reverse_direction_index_on_odd,
             "generate_masks": bool(self.generate_masks_var.get()),
             "mask_detail_level": mask_detail_level,
@@ -3477,6 +3688,8 @@ class Insta360ExtractorApp:
         run_masks = options["run_masks"]
         use_gpu_decode = options["use_gpu_decode"]
         reverse_video = options["reverse_video"]
+        single_pass = options["single_pass"]
+        write_xmp = options["write_xmp"]
         reverse_direction_index_on_odd = options["reverse_direction_index_on_odd"]
         generate_masks = options["generate_masks"]
         mask_detail_level = options["mask_detail_level"]
@@ -3498,6 +3711,8 @@ class Insta360ExtractorApp:
         assert isinstance(run_masks, bool)
         assert isinstance(use_gpu_decode, bool)
         assert isinstance(reverse_video, bool)
+        assert isinstance(single_pass, bool)
+        assert isinstance(write_xmp, bool)
         assert isinstance(reverse_direction_index_on_odd, bool)
         assert isinstance(generate_masks, bool)
         assert isinstance(mask_detail_level, str)
@@ -3535,71 +3750,56 @@ class Insta360ExtractorApp:
                 assert input_video is not None
                 assert video_stem is not None
 
-                work_queue: queue.Queue[tuple[int, Direction]] = queue.Queue()
-                for index, direction in enumerate(directions):
-                    assert isinstance(direction, Direction)
-                    work_queue.put((index, direction))
+                focal_length_35mm = compute_focal_length_35mm(fov, width, height) if write_xmp else None
+                if focal_length_35mm is not None:
+                    self.log_queue.put(
+                        (
+                            "log",
+                            f"RealityScan用XMP: 35mm換算焦点距離 {focal_length_35mm:.4f}mm / 歪みなし / 全画像を同一キャリブレーショングループ",
+                        )
+                    )
 
-                completed = 0
-                completed_lock = threading.Lock()
-                errors: list[str] = []
-                errors_lock = threading.Lock()
-
-                def worker() -> None:
-                    nonlocal completed
-
-                    while not self.stop_requested.is_set():
-                        try:
-                            index, direction = work_queue.get_nowait()
-                        except queue.Empty:
-                            return
-
-                        try:
-                            job_status, detail = self._run_direction_job(
-                                ffmpeg_path=ffmpeg_path,
-                                input_video=input_video,
-                                output_dir=output_dir,
-                                video_stem=video_stem,
-                                direction=direction,
-                                index=index,
-                                total=total,
-                                fps=fps,
-                                fov=fov,
-                                width=width,
-                                height=height,
-                                use_gpu_decode=use_gpu_decode,
-                                reverse_video=reverse_video,
-                                reverse_direction_index_on_odd=reverse_direction_index_on_odd,
-                            )
-
-                            if job_status == "ok":
-                                with completed_lock:
-                                    completed += 1
-                                    self.log_queue.put(("log", f"完了: {completed}/{total}"))
-                            elif job_status == "error":
-                                with errors_lock:
-                                    if not errors and detail:
-                                        errors.append(detail)
-                                self.stop_requested.set()
-                                self._terminate_active_processes()
-                                return
-                            else:
-                                return
-                        finally:
-                            work_queue.task_done()
-
-                workers = [threading.Thread(target=worker, daemon=True) for _ in range(parallelism)]
-                for worker_thread in workers:
-                    worker_thread.start()
-                for worker_thread in workers:
-                    worker_thread.join()
-
-                if errors:
-                    self.log_queue.put(("error", errors[0]))
-                    return
-                if self.stop_requested.is_set():
-                    self.log_queue.put(("status", "停止しました。"))
-                    return
+                if single_pass:
+                    job_status, detail = self._run_single_pass_job(
+                        ffmpeg_path=ffmpeg_path,
+                        input_video=input_video,
+                        output_dir=output_dir,
+                        video_stem=video_stem,
+                        directions=directions,
+                        fps=fps,
+                        fov=fov,
+                        width=width,
+                        height=height,
+                        use_gpu_decode=use_gpu_decode,
+                        reverse_video=reverse_video,
+                        reverse_direction_index_on_odd=reverse_direction_index_on_odd,
+                        focal_length_35mm=focal_length_35mm,
+                    )
+                    if job_status == "error":
+                        self.log_queue.put(("error", detail or "抽出に失敗しました。"))
+                        return
+                    if job_status != "ok" or self.stop_requested.is_set():
+                        self.log_queue.put(("status", "停止しました。"))
+                        return
+                else:
+                    if not self._run_direction_pool(
+                        ffmpeg_path=ffmpeg_path,
+                        input_video=input_video,
+                        output_dir=output_dir,
+                        video_stem=video_stem,
+                        directions=directions,
+                        total=total,
+                        parallelism=parallelism,
+                        fps=fps,
+                        fov=fov,
+                        width=width,
+                        height=height,
+                        use_gpu_decode=use_gpu_decode,
+                        reverse_video=reverse_video,
+                        reverse_direction_index_on_odd=reverse_direction_index_on_odd,
+                        focal_length_35mm=focal_length_35mm,
+                    ):
+                        return
 
             if run_masks:
                 self._generate_segformer_masks(
@@ -3669,6 +3869,7 @@ class Insta360ExtractorApp:
         direction_idx: int,
         direction_count: int,
         reverse_direction_index_on_odd: bool,
+        focal_length_35mm: float | None = None,
     ) -> None:
         for temp_image_path in sorted(temp_output_dir.glob("*.jpg")):
             if self.stop_requested.is_set():
@@ -3691,6 +3892,170 @@ class Insta360ExtractorApp:
                 final_image_path.unlink()
             shutil.move(str(temp_image_path), str(final_image_path))
 
+            if focal_length_35mm is not None:
+                write_xmp_sidecar(final_image_path, focal_length_35mm)
+
+    def _run_direction_pool(
+        self,
+        ffmpeg_path: str,
+        input_video: Path,
+        output_dir: Path,
+        video_stem: str,
+        directions: list[Direction],
+        total: int,
+        parallelism: int,
+        fps: float,
+        fov: float,
+        width: int,
+        height: int,
+        use_gpu_decode: bool,
+        reverse_video: bool,
+        reverse_direction_index_on_odd: bool,
+        focal_length_35mm: float | None,
+    ) -> bool:
+        """方向ごとに ffmpeg を起動する従来経路。処理を続行してよければ True を返す。"""
+        work_queue: queue.Queue[tuple[int, Direction]] = queue.Queue()
+        for index, direction in enumerate(directions):
+            assert isinstance(direction, Direction)
+            work_queue.put((index, direction))
+
+        completed = 0
+        completed_lock = threading.Lock()
+        errors: list[str] = []
+        errors_lock = threading.Lock()
+
+        def worker() -> None:
+            nonlocal completed
+
+            while not self.stop_requested.is_set():
+                try:
+                    index, direction = work_queue.get_nowait()
+                except queue.Empty:
+                    return
+
+                try:
+                    job_status, detail = self._run_direction_job(
+                        ffmpeg_path=ffmpeg_path,
+                        input_video=input_video,
+                        output_dir=output_dir,
+                        video_stem=video_stem,
+                        direction=direction,
+                        index=index,
+                        total=total,
+                        fps=fps,
+                        fov=fov,
+                        width=width,
+                        height=height,
+                        use_gpu_decode=use_gpu_decode,
+                        reverse_video=reverse_video,
+                        reverse_direction_index_on_odd=reverse_direction_index_on_odd,
+                        focal_length_35mm=focal_length_35mm,
+                    )
+
+                    if job_status == "ok":
+                        with completed_lock:
+                            completed += 1
+                            self.log_queue.put(("log", f"完了: {completed}/{total}"))
+                    elif job_status == "error":
+                        with errors_lock:
+                            if not errors and detail:
+                                errors.append(detail)
+                        self.stop_requested.set()
+                        self._terminate_active_processes()
+                        return
+                    else:
+                        return
+                finally:
+                    work_queue.task_done()
+
+        workers = [threading.Thread(target=worker, daemon=True) for _ in range(parallelism)]
+        for worker_thread in workers:
+            worker_thread.start()
+        for worker_thread in workers:
+            worker_thread.join()
+
+        if errors:
+            self.log_queue.put(("error", errors[0]))
+            return False
+        if self.stop_requested.is_set():
+            self.log_queue.put(("status", "停止しました。"))
+            return False
+        return True
+
+    def _run_single_pass_job(
+        self,
+        ffmpeg_path: str,
+        input_video: Path,
+        output_dir: Path,
+        video_stem: str,
+        directions: list[Direction],
+        fps: float,
+        fov: float,
+        width: int,
+        height: int,
+        use_gpu_decode: bool,
+        reverse_video: bool,
+        reverse_direction_index_on_odd: bool,
+        focal_length_35mm: float | None,
+    ) -> tuple[str, str | None]:
+        """入力を 1 回だけデコードして全方向を同時に書き出す。"""
+        total = len(directions)
+        label = f"[1パス/{total}方向]"
+        self.log_queue.put(("log", f"{label} 単一デコードで全方向を抽出します。"))
+
+        attempts = [use_gpu_decode]
+        if use_gpu_decode:
+            attempts.append(False)
+
+        with tempfile.TemporaryDirectory(prefix="insta360_extract_") as temp_root_str:
+            temp_root = Path(temp_root_str)
+            temp_dirs = [temp_root / f"{index:04d}" for index in range(total)]
+
+            for attempt_index, gpu_attempt in enumerate(attempts):
+                if self.stop_requested.is_set():
+                    return "stopped", None
+
+                for temp_dir in temp_dirs:
+                    if temp_dir.exists():
+                        shutil.rmtree(temp_dir)
+                    temp_dir.mkdir(parents=True)
+
+                if gpu_attempt:
+                    self.log_queue.put(("log", f"{label} CUDAデコードで開始"))
+                elif use_gpu_decode and attempt_index > 0:
+                    self.log_queue.put(("log", f"{label} CUDAデコードに失敗したためCPUデコードで再試行"))
+
+                command = build_single_pass_ffmpeg_command(
+                    ffmpeg_path=ffmpeg_path,
+                    input_video=input_video,
+                    output_patterns=[temp_dir / "%04d.jpg" for temp_dir in temp_dirs],
+                    directions=directions,
+                    fps=fps,
+                    fov=fov,
+                    width=width,
+                    height=height,
+                    use_gpu_decode=gpu_attempt,
+                    reverse_video=reverse_video,
+                )
+                status, detail = self._run_ffmpeg_process(0, label, command)
+                if status == "ok":
+                    for index, temp_dir in enumerate(temp_dirs):
+                        self._finalize_direction_outputs(
+                            temp_dir,
+                            output_dir,
+                            video_stem,
+                            index,
+                            total,
+                            reverse_direction_index_on_odd=reverse_direction_index_on_odd,
+                            focal_length_35mm=focal_length_35mm,
+                        )
+                        self.log_queue.put(("log", f"完了: {index + 1}/{total}"))
+                    return "ok", None
+                if status == "stopped":
+                    return "stopped", None
+
+            return "error", detail
+
     def _run_direction_job(
         self,
         ffmpeg_path: str,
@@ -3707,6 +4072,7 @@ class Insta360ExtractorApp:
         use_gpu_decode: bool,
         reverse_video: bool,
         reverse_direction_index_on_odd: bool,
+        focal_length_35mm: float | None = None,
     ) -> tuple[str, str | None]:
         even_output_path = build_output_image_path(
             output_dir,
@@ -3778,6 +4144,7 @@ class Insta360ExtractorApp:
                         index,
                         total,
                         reverse_direction_index_on_odd=reverse_direction_index_on_odd,
+                        focal_length_35mm=focal_length_35mm,
                     )
                     return "ok", None
                 if status == "stopped":

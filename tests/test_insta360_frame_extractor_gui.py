@@ -11,6 +11,7 @@ from insta360_frame_extractor_gui import (
     build_direction_filter_graph,
     build_extracted_image_glob,
     build_footprint_segments,
+    build_frame_cache_path,
     build_mask_output_path,
     build_merged_ffmpeg_command,
     build_overlapping_tile_regions,
@@ -34,8 +35,9 @@ from insta360_frame_extractor_gui import (
     mask_contains_excluded_region,
     parse_angle,
     parse_ffmpeg_time_seconds,
+    mask_generation_enabled_in_settings,
     parse_probability_threshold,
-    preload_native_backends,
+    preload_mask_backends,
     resolve_mask_detail_preset,
     select_ffmpeg_error_detail,
 )
@@ -200,23 +202,46 @@ class Insta360FrameExtractorGuiTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 load_image_bgr(empty)
 
-    def test_preload_native_backends_is_safe_to_call(self) -> None:
-        # Tk を作る前に torch の DLL を読ませるためのフック。
-        # 呼んでも例外を出さず、何度呼んでも良いこと。
-        preload_native_backends()
-        preload_native_backends()
+    def test_preload_mask_backends_is_safe_to_call(self) -> None:
+        # 呼んでも例外を出さず、何度呼んでも良いこと。戻り値は成否。
+        first = preload_mask_backends()
+        second = preload_mask_backends()
+        self.assertIsInstance(first, bool)
+        self.assertEqual(first, second)
 
     def test_main_preloads_before_creating_the_tk_root(self) -> None:
-        # 順序が逆になると Windows でマスク生成がプロセスごと落ちる。
+        # 順序が逆になると、マスク生成がプロセスごと落ちるか終了時にフォールトする。
         import inspect
         import insta360_frame_extractor_gui as module
 
         source = inspect.getsource(module.main)
         self.assertLess(
-            source.index("preload_native_backends()"),
+            source.index("preload_mask_backends()"),
             source.index("tk.Tk()"),
-            "preload_native_backends() must run before tk.Tk()",
+            "preload_mask_backends() must run before tk.Tk()",
         )
+
+    def test_mask_generation_enabled_in_settings_reads_the_flag(self) -> None:
+        import insta360_frame_extractor_gui as module
+
+        original = module.default_settings_path
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Path(temp_dir) / ".settings.json"
+            module.default_settings_path = lambda: settings
+            try:
+                # 無い / 壊れている / dict でない場合は False。
+                self.assertFalse(mask_generation_enabled_in_settings())
+                settings.write_text("{ broken", encoding="utf-8")
+                self.assertFalse(mask_generation_enabled_in_settings())
+                settings.write_text("[]", encoding="utf-8")
+                self.assertFalse(mask_generation_enabled_in_settings())
+
+                settings.write_text('{"generate_masks": false}', encoding="utf-8")
+                self.assertFalse(mask_generation_enabled_in_settings())
+                settings.write_text('{"generate_masks": true}', encoding="utf-8")
+                self.assertTrue(mask_generation_enabled_in_settings())
+            finally:
+                module.default_settings_path = original
 
     def test_mask_batch_limit_allows_one_pass_per_image(self) -> None:
         # 最高 は 2133x2133 で 9 タイルなので、上限が 9 未満だと必ず分割される。
@@ -318,13 +343,14 @@ class Insta360FrameExtractorGuiTests(unittest.TestCase):
         )
 
     def test_direction_filter_graph_reports_its_output_pads(self) -> None:
-        graph, outputs = build_direction_filter_graph(
+        graph, outputs, cache_pad = build_direction_filter_graph(
             generate_ring_directions(4, 0.0), 1.0, 90.0, 1024, 1024
         )
         self.assertEqual(outputs, [("[e0]", 0), ("[e1]", 1), ("[e2]", 2), ("[e3]", 3)])
         self.assertEqual(graph.count(";"), 4)
+        self.assertIsNone(cache_pad)
 
-        _, parity_outputs = build_direction_filter_graph(
+        _, parity_outputs, _ = build_direction_filter_graph(
             generate_ring_directions(4, 0.0), 1.0, 90.0, 1024, 1024,
             reverse_direction_index_on_odd=True,
         )
@@ -333,6 +359,65 @@ class Insta360FrameExtractorGuiTests(unittest.TestCase):
             [("[e0]", 0), ("[o0]", 3), ("[e1]", 1), ("[o1]", 2),
              ("[e2]", 2), ("[o2]", 1), ("[e3]", 3), ("[o3]", 0)],
         )
+
+    def test_direction_filter_graph_can_add_a_cache_branch(self) -> None:
+        # キャッシュ枝は split を 1 本増やすだけ。方向の枝は変わらない。
+        graph, outputs, cache_pad = build_direction_filter_graph(
+            generate_ring_directions(6, 0.0), 1.5, 100.0, 2133, 2133,
+            use_gpu_decode=True, include_cache_branch=True,
+        )
+        self.assertEqual(cache_pad, "[s6]")
+        self.assertEqual(len(outputs), 6)
+        self.assertIn("split=7", graph)
+        # キャッシュは v360 の手前から取るので、画角や方向数に依存しない。
+        self.assertEqual(graph.count("v360="), 6)
+
+        plain_graph, plain_outputs, _ = build_direction_filter_graph(
+            generate_ring_directions(6, 0.0), 1.5, 100.0, 2133, 2133, use_gpu_decode=True,
+        )
+        self.assertEqual(plain_outputs, outputs)
+        self.assertEqual(
+            plain_graph.replace("split=6", "split=7"),
+            graph.replace("[s6]", ""),
+        )
+
+    def test_merged_command_appends_the_cache_output(self) -> None:
+        command = self.merged_command(
+            directions=generate_ring_directions(3, 0.0),
+            use_gpu_decode=True,
+            frame_cache_output=Path("C:/output/.insta360_frame_cache/c.mkv"),
+        )
+        groups = self.output_groups(command)
+        # 方向の出力は 3 本のまま。キャッシュは 4 本目の -map として付く。
+        self.assertEqual(len(groups), 4)
+        cache_group = groups[-1]
+        self.assertEqual(cache_group[0], "[s3]")
+        self.assertIn("utvideo", cache_group[1])
+        # フルレンジを維持しないと出力 JPEG がビット一致しなくなる。
+        self.assertEqual(cache_group[1][cache_group[1].index("-pix_fmt") + 1], "yuvj420p")
+        self.assertEqual(cache_group[1][cache_group[1].index("-color_range") + 1], "pc")
+        self.assertTrue(cache_group[1][-1].endswith("c.mkv"))
+        # キャッシュ枝は画像出力ではないので -frame_pts は付けない。
+        self.assertNotIn("-frame_pts", cache_group[1])
+
+    def test_frame_cache_path_keys_on_source_and_fps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video = root / "clip.mp4"
+            video.write_bytes(b"x" * 1024)
+            cache_dir = root / "cache"
+
+            first = build_frame_cache_path(cache_dir, video, 1.5)
+            self.assertEqual(first.parent, cache_dir)
+            self.assertTrue(first.name.startswith("clip_1.5fps_"))
+            self.assertTrue(first.name.endswith(".mkv"))
+            # 同じ入力・同じ fps なら同じ名前。
+            self.assertEqual(first, build_frame_cache_path(cache_dir, video, 1.5))
+            # fps が違えばフレーム集合が違うので別のキャッシュ。
+            self.assertNotEqual(first, build_frame_cache_path(cache_dir, video, 0.5))
+            # 中身が変われば別のキャッシュ。
+            video.write_bytes(b"y" * 2048)
+            self.assertNotEqual(first, build_frame_cache_path(cache_dir, video, 1.5))
 
     def test_merged_command_decodes_once_and_fans_out_to_every_direction(self) -> None:
         directions = generate_ring_directions(8, 0.0)

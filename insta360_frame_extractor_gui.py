@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import hashlib
 import json
 import math
 import os
@@ -12,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -67,8 +69,20 @@ DEFAULT_MASK_PRECISION = "fp16"
 MASK_DECODE_WORKERS = 3
 MASK_WRITE_WORKERS = 4
 MASK_WORKERS_PER_DEVICE = 2
+# デコード済みフレームのキャッシュ。
+# ロスレスかつ「デコードが速い」ことが要件。実測 (7680x3840):
+#   utvideo      12.1 MiB/frame  デコード 83.2 fps
+#   hevc_nvenc   12.1 MiB/frame  デコード  3.1 fps  (ロスレス HEVC は復号が重い)
+#   ffv1          6.7 MiB/frame  デコード  6.2 fps
+# 元動画は yuvj420p (フルレンジ) なので -pix_fmt / -color_range を明示しないと
+# エンコード時に制限レンジへ変換され、出力 JPEG がビット一致しなくなる (実測)。
+FRAME_CACHE_DIR_NAME = ".insta360_frame_cache"
+FRAME_CACHE_SUFFIX = ".mkv"
+FRAME_CACHE_ENCODER_ARGS = ("-c:v", "utvideo", "-pix_fmt", "yuvj420p", "-color_range", "pc")
 JPEG_EOI_MARKER = b"\xff\xd9"
 JPEG_EOI_SEARCH_BYTES = 1024
+# preload_mask_backends() が成功したかどうか。Tk より前でしか成功させられない。
+MASK_BACKENDS_READY = False
 SETTINGS_COLUMN_COUNT = 8
 # ffmpeg は本当の原因を数行前に出し、最終行は "Conversion failed!" のような
 # 無情報な要約になることが多い。原因になり得る行だけを拾うためのパターン。
@@ -87,6 +101,8 @@ WINDOWS_COMMAND_LENGTH_LIMIT = 30000
 EXTRACTION_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
 # duration 由来の想定枚数は最終フレーム PTS と最大 1 フレームずれる。
 EXTRACTION_FRAME_COUNT_TOLERANCE = 1
+# 実測 7680x3840 / utvideo: 12.1 MiB/frame。サイズ見積りの表示に使う。
+FRAME_CACHE_BYTES_PER_FRAME_ESTIMATE = 12.1 * 2 ** 20
 MASK_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
 DEFAULT_MASK_DETAIL_LEVEL = "標準"
 DEFAULT_MASK_CONFIDENCE_THRESHOLD = 0.7
@@ -462,10 +478,15 @@ def build_direction_filter_graph(
     use_gpu_decode: bool = False,
     reverse_video: bool = False,
     reverse_direction_index_on_odd: bool = False,
-) -> tuple[str, list[tuple[str, int]]]:
+    include_cache_branch: bool = False,
+) -> tuple[str, list[tuple[str, int]], str | None]:
     """1 回のデコードから全方向を作る filter_complex を組み立てる。
 
-    戻り値は (filter_complex, [(出力パッド, 方向インデックス), ...])。
+    戻り値は (filter_complex, [(出力パッド, 方向インデックス), ...], キャッシュ用パッド)。
+
+    `include_cache_branch` を立てると split を 1 本増やし、その枝を
+    デコード済みフレームのキャッシュ書き出しに使う。枝は v360 の手前 (共有部の
+    直後) から取るので、方向数や画角を変えても同じキャッシュが再利用できる。
 
     奇数フレーム逆順が有効な場合は方向ごとに 2 出力へ分け、`select` で偶数
     フレームと奇数フレームを振り分ける。奇数フレーム側には (N-1)-i を割り当てる
@@ -478,8 +499,9 @@ def build_direction_filter_graph(
         raise ValueError("少なくとも1つの書き出し方向を指定してください。")
 
     direction_count = len(directions)
+    branch_count = direction_count + (1 if include_cache_branch else 0)
     chains = [
-        build_shared_decode_head(direction_count, fps, use_gpu_decode, reverse_video)
+        build_shared_decode_head(branch_count, fps, use_gpu_decode, reverse_video)
     ]
     outputs: list[tuple[str, int]] = []
 
@@ -495,7 +517,8 @@ def build_direction_filter_graph(
             chains.append(f"[s{index}]{transform}[e{index}]")
             outputs.append((f"[e{index}]", index))
 
-    return ";".join(chains), outputs
+    cache_pad = f"[s{direction_count}]" if include_cache_branch else None
+    return ";".join(chains), outputs, cache_pad
 
 
 def build_merged_ffmpeg_command(
@@ -511,6 +534,7 @@ def build_merged_ffmpeg_command(
     use_gpu_decode: bool = False,
     reverse_video: bool = False,
     reverse_direction_index_on_odd: bool = False,
+    frame_cache_output: Path | None = None,
 ) -> list[str]:
     """全方向を 1 プロセスで書き出すコマンド。
 
@@ -520,7 +544,7 @@ def build_merged_ffmpeg_command(
     最終ファイル名を image2 に直接書かせるので一時ディレクトリと移動は不要。
     `-frame_pts 1` の採番は旧実装の `-start_number 0` と一致することを実測済み。
     """
-    filter_complex, outputs = build_direction_filter_graph(
+    filter_complex, outputs, cache_pad = build_direction_filter_graph(
         directions,
         fps,
         fov,
@@ -529,6 +553,7 @@ def build_merged_ffmpeg_command(
         use_gpu_decode=use_gpu_decode,
         reverse_video=reverse_video,
         reverse_direction_index_on_odd=reverse_direction_index_on_odd,
+        include_cache_branch=frame_cache_output is not None,
     )
 
     command = [ffmpeg_path, "-hide_banner", "-y"]
@@ -561,24 +586,56 @@ def build_merged_ffmpeg_command(
             ]
         )
 
-    assert_ffmpeg_command_is_shippable(command, outputs)
+    if cache_pad is not None and frame_cache_output is not None:
+        command.extend(["-map", cache_pad, "-fps_mode", "passthrough"])
+        command.extend(FRAME_CACHE_ENCODER_ARGS)
+        command.append(str(frame_cache_output))
+
+    assert_ffmpeg_command_is_shippable(
+        command,
+        outputs,
+        extra_outputs=1 if frame_cache_output is not None else 0,
+    )
     return command
 
 
-def assert_ffmpeg_command_is_shippable(command: list[str], outputs: list[tuple[str, int]]) -> None:
-    """出荷前に静的に確かめられる不変条件。"""
+def build_frame_cache_path(cache_dir: Path, input_video: Path, fps: float) -> Path:
+    """キャッシュのファイル名。鍵は (入力パス, サイズ, mtime, fps)。
+
+    fps を含めるのは、キャッシュが fps フィルタ通過後のフレームを保持するため。
+    サイズと mtime を含めるのは、同名で中身が変わった動画を取り違えないため。
+    """
+    try:
+        stat = input_video.stat()
+        signature = f"{input_video.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{fps}"
+    except OSError:
+        signature = f"{input_video}|missing|{fps}"
+    digest = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:12]
+    return cache_dir / f"{input_video.stem}_{direction_aware_float(fps)}fps_{digest}{FRAME_CACHE_SUFFIX}"
+
+
+def assert_ffmpeg_command_is_shippable(
+    command: list[str],
+    outputs: list[tuple[str, int]],
+    extra_outputs: int = 0,
+) -> None:
+    """出荷前に静的に確かめられる不変条件。
+
+    `extra_outputs` は画像以外の出力 (フレームキャッシュ) の本数。
+    キャッシュは連番画像ではないので -frame_pts は付かない。
+    """
     total_length = sum(len(argument) + 1 for argument in command)
     if total_length >= WINDOWS_COMMAND_LENGTH_LIMIT:
         raise ValueError(
             f"ffmpeg コマンドが Windows の上限に近すぎます ({total_length} 文字)。"
             "方向数を減らしてください。"
         )
-    if command.count("-map") != len(outputs):
+    if command.count("-map") != len(outputs) + extra_outputs:
         raise AssertionError("出力グループ数が -map の数と一致しません。")
-    if command.count("-fps_mode") != len(outputs):
+    if command.count("-fps_mode") != len(outputs) + extra_outputs:
         raise AssertionError("全出力に -fps_mode passthrough が必要です。")
     if command.count("-frame_pts") != len(outputs):
-        raise AssertionError("全出力に -frame_pts 1 が必要です。")
+        raise AssertionError("画像出力には -frame_pts 1 が必要です。")
 
 
 def compute_expected_frame_count(duration_seconds: float | None, fps: float) -> int | None:
@@ -1430,6 +1487,7 @@ class Insta360ExtractorApp:
         self.reverse_var = tk.BooleanVar(value=False)
         self.reverse_direction_index_on_odd_var = tk.BooleanVar(value=False)
         self.generate_masks_var = tk.BooleanVar(value=False)
+        self.use_frame_cache_var = tk.BooleanVar(value=False)
         self.mask_detail_level_var = tk.StringVar(value=DEFAULT_MASK_DETAIL_LEVEL)
         self.mask_precision_var = tk.StringVar(value=DEFAULT_MASK_PRECISION)
         self.mask_confidence_threshold_var = tk.StringVar(value=direction_aware_float(DEFAULT_MASK_CONFIDENCE_THRESHOLD))
@@ -1455,6 +1513,7 @@ class Insta360ExtractorApp:
         self.process_lock = threading.Lock()
         self.current_processes: dict[int, subprocess.Popen[str]] = {}
         self.segformer_mask_generators: list[SegFormerMaskGenerator] = []
+        self.segformer_lock = threading.RLock()
         self.segformer_cache_key: tuple[str, tuple[str, ...]] | None = None
 
         self.preview_photo: tk.PhotoImage | None = None
@@ -1635,6 +1694,11 @@ class Insta360ExtractorApp:
         run_group = settings_group(2, 1)
         ttk.Checkbutton(run_group, text="画像抽出", variable=self.run_extract_var).pack(side="left")
         ttk.Checkbutton(run_group, text="マスク生成", variable=self.generate_masks_var).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            run_group,
+            text="フレームキャッシュ",
+            variable=self.use_frame_cache_var,
+        ).pack(side="left", padx=(12, 0))
 
         settings_label("マスク対象", 2, 2)
         category_group = settings_group(2, 3, columnspan=SETTINGS_COLUMN_COUNT - 3)
@@ -1958,6 +2022,7 @@ class Insta360ExtractorApp:
             "reverse": bool(self.reverse_var.get()),
             "reverse_direction_index_on_odd": bool(self.reverse_direction_index_on_odd_var.get()),
             "generate_masks": bool(self.generate_masks_var.get()),
+            "use_frame_cache": bool(self.use_frame_cache_var.get()),
             "mask_detail_level": self.mask_detail_level_var.get().strip(),
             "mask_precision": self.mask_precision_var.get().strip(),
             "mask_confidence_threshold": self.mask_confidence_threshold_var.get().strip(),
@@ -2072,6 +2137,7 @@ class Insta360ExtractorApp:
             self.mask_confidence_threshold_var.set(saved_mask_confidence_threshold)
 
         for key, variable in (
+            ("use_frame_cache", self.use_frame_cache_var),
             ("mask_sky", self.mask_sky_var),
             ("mask_person", self.mask_person_var),
             ("mask_car", self.mask_car_var),
@@ -2207,20 +2273,43 @@ class Insta360ExtractorApp:
         def emit(message: str) -> None:
             self.log_queue.put(("log", message))
 
-        wanted = self._mask_devices()
-        cache_key = (precision, tuple(str(device) for device in wanted))
-        if self.segformer_cache_key != cache_key:
-            self._release_mask_generators()
-            self.segformer_cache_key = cache_key
+        with self.segformer_lock:
+            wanted = self._mask_devices()
+            cache_key = (precision, tuple(str(device) for device in wanted))
+            if self.segformer_cache_key != cache_key:
+                self._release_mask_generators_locked()
+                self.segformer_cache_key = cache_key
 
-        if not self.segformer_mask_generators:
-            for device in wanted:
-                self.segformer_mask_generators.append(
-                    SegFormerMaskGenerator(device=device, precision=precision, log_callback=emit)
-                )
-        return self.segformer_mask_generators
+            if not self.segformer_mask_generators:
+                for device in wanted:
+                    self.segformer_mask_generators.append(
+                        SegFormerMaskGenerator(device=device, precision=precision, log_callback=emit)
+                    )
+            return list(self.segformer_mask_generators)
+
+    def _start_mask_generator_preload(self, precision: str) -> threading.Thread:
+        """抽出中にマスクモデルをロードしておく。
+
+        コールドロードは実測で 1 デバイス約 13 秒、2 デバイスで倍かかる。
+        抽出は NVDEC と v360 (CPU) 律速でこの間 GPU の演算ユニットは空いているので、
+        重ねればほぼ無料で隠せる。失敗はここでは伏せ、マスク段で改めて起こす。
+        """
+        def load() -> None:
+            try:
+                self._get_segformer_mask_generators(precision)
+                self.log_queue.put(("log", "マスクモデルの事前ロードが完了しました。"))
+            except Exception as error:
+                self.log_queue.put(("log", f"マスクモデルの事前ロードに失敗しました: {error}"))
+
+        thread = threading.Thread(target=load, daemon=True, name="mask-preload")
+        thread.start()
+        return thread
 
     def _release_mask_generators(self) -> None:
+        with self.segformer_lock:
+            self._release_mask_generators_locked()
+
+    def _release_mask_generators_locked(self) -> None:
         for generator in self.segformer_mask_generators:
             try:
                 generator.close()
@@ -3822,6 +3911,15 @@ class Insta360ExtractorApp:
             raise ValueError("マスク精度は fp16 か fp32 から選択してください。")
         mask_categories = self._selected_mask_categories()
 
+        if run_masks and not MASK_BACKENDS_READY:
+            # ここで拒否しないと、ワーカースレッドでのモデルロード時に
+            # プロセスごと落ちる (Windows の DLL 解決の問題)。
+            raise ValueError(
+                "マスク生成の準備ができていません。"
+                "`マスク生成` を ON にしたまま一度アプリを終了し、再起動してください。"
+                "(Windows では Tk より先に torch / transformers を読み込む必要があります)"
+            )
+
         ffmpeg_path = self.ffmpeg_path or shutil.which("ffmpeg")
         if ffmpeg_path is None:
             raise ValueError("ffmpeg が見つかりません。PATH に追加してから実行してください。")
@@ -3852,6 +3950,7 @@ class Insta360ExtractorApp:
             "reverse_video": bool(self.reverse_var.get()),
             "reverse_direction_index_on_odd": reverse_direction_index_on_odd,
             "generate_masks": bool(self.generate_masks_var.get()),
+            "use_frame_cache": bool(self.use_frame_cache_var.get()),
             "mask_detail_level": mask_detail_level,
             "mask_precision": mask_precision,
             "mask_confidence_threshold": mask_confidence_threshold,
@@ -3876,6 +3975,7 @@ class Insta360ExtractorApp:
         reverse_video = options["reverse_video"]
         reverse_direction_index_on_odd = options["reverse_direction_index_on_odd"]
         generate_masks = options["generate_masks"]
+        use_frame_cache = options["use_frame_cache"]
         mask_detail_level = options["mask_detail_level"]
         mask_precision = options["mask_precision"]
         mask_confidence_threshold = options["mask_confidence_threshold"]
@@ -3898,6 +3998,7 @@ class Insta360ExtractorApp:
         assert isinstance(reverse_video, bool)
         assert isinstance(reverse_direction_index_on_odd, bool)
         assert isinstance(generate_masks, bool)
+        assert isinstance(use_frame_cache, bool)
         assert isinstance(mask_detail_level, str)
         assert isinstance(mask_precision, str)
         assert isinstance(mask_confidence_threshold, float)
@@ -3928,6 +4029,11 @@ class Insta360ExtractorApp:
                     f"除外しきい値: {threshold_text} | 対象: {categories_text}",
                 )
             )
+
+            # 抽出の裏でモデルをロードしておく (実測 13 秒/デバイスを隠せる)。
+            mask_preload: threading.Thread | None = None
+            if run_masks and run_extract:
+                mask_preload = self._start_mask_generator_preload(mask_precision)
 
             extracted_this_run = False
             if run_extract:
@@ -3963,6 +4069,7 @@ class Insta360ExtractorApp:
                     reverse_video=reverse_video,
                     reverse_direction_index_on_odd=reverse_direction_index_on_odd,
                     expected_frames=expected_frames,
+                    use_frame_cache=use_frame_cache,
                 )
 
                 if status == "error":
@@ -3984,6 +4091,8 @@ class Insta360ExtractorApp:
                 extracted_this_run = True
 
             if run_masks:
+                if mask_preload is not None:
+                    mask_preload.join()
                 self._warn_about_orphaned_masks(output_dir, video_stem)
                 self._generate_segformer_masks(
                     output_dir,
@@ -4130,6 +4239,90 @@ class Insta360ExtractorApp:
                 pass
         return removed
 
+    def _resolve_frame_cache(
+        self,
+        input_video: Path,
+        output_dir: Path,
+        fps: float,
+        reverse_video: bool,
+        expected_frames: int | None,
+        use_frame_cache: bool,
+    ) -> tuple[Path, Path | None]:
+        """(デコード元, 書き出すキャッシュ) を決める。
+
+        Tk 変数はワーカースレッドから読めないので、有効かどうかは
+        _collect_options が main スレッドで読んだ値を受け取る。
+
+        キャッシュが使えるならデコード元をキャッシュに差し替える。無ければ
+        今回の実行で作る (split を 1 本増やすだけなので追加デコードは無い)。
+        逆再生時は作らない: reverse は共有部でキャッシュ枝より上流に入るため、
+        逆順のフレームを保存してしまう。読み出し側は reverse を後段で適用する
+        ので、既存キャッシュは逆再生でもそのまま使える。
+        """
+        if not use_frame_cache:
+            return input_video, None
+
+        cache_dir = output_dir / FRAME_CACHE_DIR_NAME
+        cache_path = build_frame_cache_path(cache_dir, input_video, fps)
+
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            problem = self._validate_frame_cache(cache_path, input_video, fps, expected_frames)
+            if problem is None:
+                size_gib = cache_path.stat().st_size / 2 ** 30
+                self.log_queue.put(
+                    ("log", f"フレームキャッシュを使用します ({size_gib:.1f} GiB): {cache_path.name}")
+                )
+                return cache_path, None
+            self.log_queue.put(("log", f"フレームキャッシュを使えません ({problem})。作り直します。"))
+            cache_path.unlink(missing_ok=True)
+
+        if reverse_video:
+            self.log_queue.put(("log", "逆再生が有効なためフレームキャッシュは作成しません。"))
+            return input_video, None
+
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            self.log_queue.put(("log", f"フレームキャッシュの作成先を用意できませんでした: {error}"))
+            return input_video, None
+
+        if expected_frames is not None:
+            estimate_gib = expected_frames * FRAME_CACHE_BYTES_PER_FRAME_ESTIMATE / 2 ** 30
+            self.log_queue.put(
+                ("log", f"フレームキャッシュを作成します (推定 {estimate_gib:.1f} GiB): {cache_path.name}")
+            )
+        return input_video, cache_path
+
+    def _validate_frame_cache(
+        self,
+        cache_path: Path,
+        input_video: Path,
+        fps: float,
+        expected_frames: int | None,
+    ) -> str | None:
+        """キャッシュが今回の条件に合うか確かめる。合わない理由を返す。"""
+        ffprobe_path = shutil.which("ffprobe")
+        if ffprobe_path is None:
+            return "ffprobe が見つかりません"
+        try:
+            cache_meta = probe_video_metadata(cache_path, ffprobe_path)
+            source_meta = probe_video_metadata(input_video, ffprobe_path)
+        except Exception as error:
+            return f"情報を取得できません: {error}"
+
+        if (cache_meta.width, cache_meta.height) != (source_meta.width, source_meta.height):
+            return (
+                f"解像度が違います (キャッシュ {cache_meta.width}x{cache_meta.height} / "
+                f"元動画 {source_meta.width}x{source_meta.height})"
+            )
+        if expected_frames is not None:
+            cached_frames = compute_expected_frame_count(cache_meta.duration_seconds, fps)
+            if cached_frames is None:
+                return "長さを取得できません"
+            if abs(cached_frames - expected_frames) > EXTRACTION_FRAME_COUNT_TOLERANCE:
+                return f"フレーム数が違います (キャッシュ {cached_frames} / 想定 {expected_frames})"
+        return None
+
     def _run_merged_extraction(
         self,
         ffmpeg_path: str,
@@ -4145,9 +4338,14 @@ class Insta360ExtractorApp:
         reverse_video: bool,
         reverse_direction_index_on_odd: bool,
         expected_frames: int | None,
+        use_frame_cache: bool = False,
     ) -> tuple[str, str | None]:
         """1 プロセスで全方向を書き出す。CUDA が駄目なら CPU デコードで再試行。"""
         total = len(directions)
+        decode_source, frame_cache_output = self._resolve_frame_cache(
+            input_video, output_dir, fps, reverse_video, expected_frames, use_frame_cache
+        )
+        reading_cache = decode_source != input_video
         removed = self._sweep_incomplete_outputs(output_dir)
         if removed:
             self.log_queue.put(("log", f"書きかけの一時ファイルを {removed} 件削除しました。"))
@@ -4168,8 +4366,10 @@ class Insta360ExtractorApp:
                 )
             )
 
-        attempts = [use_gpu_decode]
-        if use_gpu_decode:
+        # キャッシュは utvideo (ソフトウェアコーデック) なので NVDEC 経路が無い。
+        # 実測 CPU 16 スレッドで 83.2 fps 出るため、GPU デコードは要求しない。
+        attempts = [False] if reading_cache else [use_gpu_decode]
+        if not reading_cache and use_gpu_decode:
             attempts.append(False)
 
         last_detail: str | None = None
@@ -4186,7 +4386,7 @@ class Insta360ExtractorApp:
 
             command = build_merged_ffmpeg_command(
                 ffmpeg_path=ffmpeg_path,
-                input_video=input_video,
+                input_video=decode_source,
                 output_dir=output_dir,
                 video_stem=video_stem,
                 directions=directions,
@@ -4197,6 +4397,7 @@ class Insta360ExtractorApp:
                 use_gpu_decode=gpu_attempt,
                 reverse_video=reverse_video,
                 reverse_direction_index_on_odd=reverse_direction_index_on_odd,
+                frame_cache_output=frame_cache_output,
             )
             status, detail = self._run_ffmpeg_process(
                 0,
@@ -4206,9 +4407,20 @@ class Insta360ExtractorApp:
                 fps=fps,
             )
             if status == "ok":
+                if frame_cache_output is not None and frame_cache_output.is_file():
+                    size_gib = frame_cache_output.stat().st_size / 2 ** 30
+                    self.log_queue.put(
+                        ("log", f"フレームキャッシュを作成しました ({size_gib:.1f} GiB)。"
+                                "次回以降の抽出はここから読み出します。")
+                    )
                 return "ok", None
             if status == "stopped":
+                if frame_cache_output is not None:
+                    # 途中で止めたキャッシュは不完全なので残さない。
+                    frame_cache_output.unlink(missing_ok=True)
                 return "stopped", None
+            if frame_cache_output is not None:
+                frame_cache_output.unlink(missing_ok=True)
             last_detail = detail
             if not gpu_attempt:
                 return "error", detail
@@ -4482,30 +4694,62 @@ class Insta360ExtractorApp:
             setattr(self, attribute, None)
 
 
-def preload_native_backends() -> None:
-    """Tk のウィンドウを作る前に torch のネイティブ DLL を読み込む。
+def mask_generation_enabled_in_settings() -> bool:
+    """保存済み設定の generate_masks を Tk 作成前に覗く。
 
-    Windows でこの順序を守らないと、マスク生成が**プロセスごと落ちる**。
-    Tk のインタプリタを先に作ってから transformers を使うと、
-    `from_pretrained` が実行時に torchvision の C 拡張を読み込む際に
-    DLL の解決が衝突し、アクセス違反で即死する (実測: 終了コード 139、
-    クラッシュ位置は torchvision/io/image.py の ctypes.CDLL)。
-
-    先に `import torch` しておくと解消する (実測 3.1 秒、以後は正常動作)。
-    torch は任意依存なので、入っていない環境では何もしない。
-
-    SegFormerMaskGenerator を GUI 以外から使う場合も、Tk を作る前に
-    これを呼ぶこと。
+    バックエンドの先読みは 10 秒ほどかかるので、マスクを使わない利用者に
+    払わせないための判断材料として使う。
     """
     try:
-        import torch  # noqa: F401
+        payload = json.loads(default_settings_path().read_text(encoding="utf-8"))
     except Exception:
-        # torch が無い環境ではマスク生成自体を使えないので、ここは黙って抜ける。
-        return
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("generate_masks"))
+
+
+def preload_mask_backends() -> bool:
+    """Tk のウィンドウを作る**前**に torch / torchvision / transformers を読み込む。
+
+    Windows でこの順序を守らないと、マスク生成が**プロセスごと落ちる**。
+    実測した挙動:
+      - Tk を先に作ってから transformers を使うと、`from_pretrained` が
+        torchvision の C 拡張をロードする時点でアクセス違反 (終了コード 139)。
+        torchvision の拡張自体がこの環境では
+        `[WinError 1114] DLL 初期化ルーチンの実行に失敗しました` で失敗しており、
+        メインスレッドかつ Tk より前ならこれは警告で済むが、そうでないと即死する。
+      - ワーカースレッドからモデルをロードする場合は `torch` だけでは不十分で、
+        `transformers` までメインスレッドで温めておく必要がある
+        (実アプリのマスク生成は worker_thread 上で走る)。
+      - Tk の後に先読みすると処理自体は通るが、**終了時に必ずフォールトする**。
+        Tk より前に読むと終了コード 0 になる。
+
+    戻り値は成功したかどうか。失敗した場合はマスク生成を拒否する。
+    """
+    global MASK_BACKENDS_READY
+    try:
+        with warnings.catch_warnings():
+            # torchvision の画像拡張はこの環境ではロードに失敗する。
+            # マスク生成では使わないので警告は出さない。
+            warnings.simplefilter("ignore")
+            import torch  # noqa: F401
+            import torchvision  # noqa: F401
+            import torchvision.io  # noqa: F401
+            from transformers import (  # noqa: F401
+                AutoModelForSemanticSegmentation,
+                SegformerImageProcessor,
+            )
+    except Exception:
+        return False
+    MASK_BACKENDS_READY = True
+    return True
 
 
 def main() -> None:
-    preload_native_backends()
+    # マスクを使う設定なら、Tk を作る前にバックエンドを読み込む。
+    if mask_generation_enabled_in_settings():
+        preload_mask_backends()
     root = tk.Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():

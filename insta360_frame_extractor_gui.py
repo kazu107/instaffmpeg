@@ -5,6 +5,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -51,7 +52,19 @@ MASK_CATEGORY_DISPLAY_NAMES: dict[str, str] = {
     "tree": "木",
 }
 MASK_BATCH_SIZE_LIMIT = 8
+MASK_PNG_COMPRESS_LEVEL = 2
 SETTINGS_COLUMN_COUNT = 8
+# ffmpeg は本当の原因を数行前に出し、最終行は "Conversion failed!" のような
+# 無情報な要約になることが多い。原因になり得る行だけを拾うためのパターン。
+# 大文字小文字を無視するのは "CUDA_ERROR_INVALID_DEVICE: invalid device ordinal" を拾うため。
+FFMPEG_ERROR_PATTERN = re.compile(
+    r"error|invalid|failed|out of range|could not open|no such file|permission denied",
+    re.IGNORECASE,
+)
+FFMPEG_USELESS_ERROR_LINES = frozenset({"Conversion failed!"})
+FFMPEG_ERROR_LINE_BUFFER = 24
+FFMPEG_ERROR_DETAIL_LINES = 3
+FFMPEG_ERROR_DETAIL_MAX_CHARS = 500
 DEFAULT_MASK_DETAIL_LEVEL = "標準"
 DEFAULT_MASK_CONFIDENCE_THRESHOLD = 0.7
 MASK_DETAIL_PRESETS: dict[str, dict[str, int | bool]] = {
@@ -723,6 +736,40 @@ def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def select_ffmpeg_error_detail(
+    recent_lines: list[str],
+    label: str,
+    return_code: int,
+) -> str:
+    """ffmpeg の末尾ログから原因に近い行を選ぶ。
+
+    最終行だけを見ると原因が失われる。実測例:
+      v360 のパラメータ範囲外  -> 最終行 "Error : Result too large" (真因は3行前)
+      -hwaccel_device が不正   -> 最終行 "Error binding filtergraph ..." (真因は3行前)
+      出力先に書けない         -> 最終行 "Conversion failed!" (真因は3行前)
+
+    ffmpeg は原因 -> 波及の順に出力するので、該当行のうち**先頭側**が真因に近い。
+    最後の該当行を取ると無情報な要約に一番近い行を選んでしまう。
+    """
+    cleaned = [line.strip() for line in recent_lines if line.strip()]
+    if not cleaned:
+        return f"{label} ffmpeg exited with code {return_code}"
+
+    candidates: list[str] = []
+    for line in cleaned:
+        if not FFMPEG_ERROR_PATTERN.search(line):
+            continue
+        if line in FFMPEG_USELESS_ERROR_LINES or line in candidates:
+            continue
+        candidates.append(line)
+
+    selected = candidates[:FFMPEG_ERROR_DETAIL_LINES] if candidates else cleaned[-FFMPEG_ERROR_DETAIL_LINES:]
+    detail = " / ".join(selected)
+    if len(detail) > FFMPEG_ERROR_DETAIL_MAX_CHARS:
+        detail = detail[: FFMPEG_ERROR_DETAIL_MAX_CHARS - 3] + "..."
+    return detail
+
+
 def detect_cuda_hwaccel(ffmpeg_path: str | None) -> bool:
     if not ffmpeg_path:
         return False
@@ -969,7 +1016,7 @@ class SegFormerMaskGenerator:
         inputs = self.image_processor(images=batch_images, return_tensors="pt")
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
-        with self.torch.no_grad():
+        with self.torch.inference_mode():
             outputs = self.model(**inputs)
 
         excluded_indices = sorted(selected_label_ids)
@@ -985,11 +1032,7 @@ class SegFormerMaskGenerator:
                 mode="bilinear",
                 align_corners=False,
             )
-            resized_probabilities = resized_probability_maps[:, 0].cpu().numpy()
-            return [
-                build_binary_usage_mask(resized_probability, confidence_threshold)
-                for resized_probability in resized_probabilities
-            ]
+            return list(self._binarize_on_device(resized_probability_maps, confidence_threshold))
 
         binary_masks: list[object] = []
         for batch_index, target_size in enumerate(batch_sizes):
@@ -999,9 +1042,32 @@ class SegFormerMaskGenerator:
                 size=(target_height, target_width),
                 mode="bilinear",
                 align_corners=False,
-            )[0, 0].cpu().numpy()
-            binary_masks.append(build_binary_usage_mask(resized_probability_map, confidence_threshold))
+            )
+            binary_masks.append(self._binarize_on_device(resized_probability_map, confidence_threshold)[0])
         return binary_masks
+
+    def _binarize_on_device(self, probability_maps: object, confidence_threshold: float) -> object:
+        """確率マップを GPU 上で 2値化し、uint8 のまま CPU へ転送する。
+
+        従来は全解像度の float32 を CPU に落としてから `np.where` で閾値処理していた。
+        2133x2133 の 9 タイルでは転送が 4 倍(37.7MB)になり、単スレッドの numpy 比較が
+        38.2 ms/画像を占めていた。GPU 側で 2値化すれば転送は uint8 の 1/4 で済む。
+
+        閾値は float32 テンソルとして比較する。numpy 2.x (NEP 50) では
+        `float32配列 >= Python float` が float32 比較になるため、
+        `build_binary_usage_mask` と完全にビット一致する。
+        """
+        threshold = self.torch.tensor(
+            float(confidence_threshold),
+            dtype=self.torch.float32,
+            device=probability_maps.device,
+        )
+        binary = self.torch.where(
+            probability_maps[:, 0] >= threshold,
+            self.torch.zeros((), dtype=self.torch.uint8, device=probability_maps.device),
+            self.torch.full((), 255, dtype=self.torch.uint8, device=probability_maps.device),
+        )
+        return binary.cpu().numpy()
 
     def _generate_mask_high_detail(
         self,
@@ -1068,7 +1134,16 @@ class SegFormerMaskGenerator:
         if not mask_contains_excluded_region(mask_array):
             mask_path.unlink(missing_ok=True)
             return
-        self.Image.fromarray(mask_array, mode="L").save(mask_path)
+        # compress_level は既定 6。実測 (2133x2133 / 除外率 37.6%):
+        #   level 6 = 21.95 ms / 11395 B   level 2 = 15.84 ms / 11464 B (+0.6%)
+        #   level 1 = 16.69 ms / 50952 B (4.5倍に膨張)   level 0 = 4.5 MB
+        # 2 が速度とサイズの折れ点。下げすぎないこと。
+        # mode= は Pillow 13 で削除予定。2次元 uint8 配列なら "L" が自動推論される。
+        self.Image.fromarray(mask_array).save(
+            mask_path,
+            compress_level=MASK_PNG_COMPRESS_LEVEL,
+            optimize=False,
+        )
 
 
 class Insta360ExtractorApp:
@@ -3817,7 +3892,7 @@ class Insta360ExtractorApp:
                     continue
 
                 recent_lines.append(cleaned)
-                if len(recent_lines) > 12:
+                if len(recent_lines) > FFMPEG_ERROR_LINE_BUFFER:
                     recent_lines.pop(0)
                 self.log_queue.put(("log", f"{label} {cleaned}"))
 
@@ -3828,8 +3903,7 @@ class Insta360ExtractorApp:
         if self.stop_requested.is_set():
             return "stopped", None
         if return_code != 0:
-            detail = recent_lines[-1] if recent_lines else f"{label} ffmpeg exited with code {return_code}"
-            return "error", detail
+            return "error", select_ffmpeg_error_detail(recent_lines, label, return_code)
         return "ok", None
 
     def _register_process(self, process_key: int, process: subprocess.Popen[str]) -> None:

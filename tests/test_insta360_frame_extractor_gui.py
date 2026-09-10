@@ -28,6 +28,7 @@ from insta360_frame_extractor_gui import (
     parse_angle,
     parse_probability_threshold,
     resolve_mask_detail_preset,
+    select_ffmpeg_error_detail,
 )
 
 
@@ -105,6 +106,62 @@ class Insta360FrameExtractorGuiTests(unittest.TestCase):
 
     def test_resolve_mask_detail_preset_falls_back_to_default(self) -> None:
         self.assertEqual(resolve_mask_detail_preset("存在しない設定")["prioritize_detail"], False)
+
+    def test_select_ffmpeg_error_detail_leads_with_the_root_cause(self) -> None:
+        # ffmpeg は原因 -> 波及の順に出すので、最終行ではなく先頭側の該当行が真因。
+        # 以下は実際に ffmpeg 8.0.1 で再現させた 3 パターンの末尾ログ。
+        v360_out_of_range = [
+            "[Parsed_v360_1 @ 000] Value 225.000000 for parameter 'yaw' out of range [-180 - 180]",
+            "[Parsed_v360_1 @ 000] Error setting option yaw to value 225.",
+            "[vf#0:0 @ 000] Error initializing filter 'v360'",
+            "Error : Result too large",
+        ]
+        detail = select_ffmpeg_error_detail(v360_out_of_range, "[1/6]", 1)
+        self.assertIn("out of range", detail)
+        self.assertTrue(detail.startswith("[Parsed_v360_1"))
+
+        bad_hwaccel_device = [
+            "[hevc @ 000] CUDA_ERROR_INVALID_DEVICE: invalid device ordinal",
+            "[hevc @ 000] Failed setup for format cuda: hwaccel initialisation returned error.",
+            "[vist#0:0 @ 000] Decoding error: Generic error in an external library",
+            "Error binding filtergraph inputs/outputs: Generic error in an external library",
+        ]
+        detail = select_ffmpeg_error_detail(bad_hwaccel_device, "[1/6]", 1)
+        self.assertIn("invalid device ordinal", detail)
+
+        unwritable_output = [
+            "[image2 @ 000] Could not open file : Z:/nope/out_0000_00.jpg",
+            "[image2 @ 000] Could not write header (incorrect codec parameters ?): Input/output error",
+            "Error initializing output stream: Error while opening output file",
+            "Conversion failed!",
+        ]
+        detail = select_ffmpeg_error_detail(unwritable_output, "[1/6]", 1)
+        self.assertIn("Could not open file", detail)
+        # 無情報な要約だけが残ることは無い。
+        self.assertNotEqual(detail, "Conversion failed!")
+
+    def test_select_ffmpeg_error_detail_handles_missing_and_unmatched_output(self) -> None:
+        self.assertEqual(
+            select_ffmpeg_error_detail([], "[3/8]", 69),
+            "[3/8] ffmpeg exited with code 69",
+        )
+        self.assertEqual(
+            select_ffmpeg_error_detail(["   ", ""], "[3/8]", 1),
+            "[3/8] ffmpeg exited with code 1",
+        )
+        # 該当行が無いときは末尾数行をそのまま返す。
+        stats_only = ["frame=  10 fps=2.0 q=2.0 size=N/A time=00:00:05.00 bitrate=N/A speed=1.2x"]
+        self.assertEqual(select_ffmpeg_error_detail(stats_only, "[1/1]", 1), stats_only[0])
+
+    def test_select_ffmpeg_error_detail_is_bounded_and_deduplicated(self) -> None:
+        repeated = ["[image2 @ 000] Could not open file : x.jpg"] * 10
+        detail = select_ffmpeg_error_detail(repeated, "[1/1]", 1)
+        self.assertEqual(detail, repeated[0])
+
+        long_lines = [f"Error {i}: " + "x" * 400 for i in range(5)]
+        detail = select_ffmpeg_error_detail(long_lines, "[1/1]", 1)
+        self.assertLessEqual(len(detail), 500)
+        self.assertTrue(detail.endswith("..."))
 
     def test_parse_probability_threshold_rejects_zero_and_out_of_range(self) -> None:
         # 0 を許すと「確率 >= 0」が常に真になり全面黒マスクになる。

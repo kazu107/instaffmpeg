@@ -6,17 +6,20 @@ from pathlib import Path
 from insta360_frame_extractor_gui import (
     Direction,
     DirectionSet,
+    build_direction_filter_graph,
     build_extracted_image_glob,
     build_footprint_segments,
-    build_ffmpeg_command,
     build_mask_output_path,
+    build_merged_ffmpeg_command,
     build_overlapping_tile_regions,
     build_output_image_path,
     build_output_pattern,
+    build_shared_decode_head,
     build_tile_starts,
     build_binary_usage_mask,
     collect_segformer_excluded_label_groups,
     collect_segformer_excluded_label_ids,
+    compute_expected_frame_count,
     compute_output_direction_index,
     compute_vertical_fov,
     compute_preview_box,
@@ -24,8 +27,10 @@ from insta360_frame_extractor_gui import (
     direction_index_width,
     fit_size_within_bounds,
     generate_ring_directions,
+    is_ffmpeg_progress_line,
     mask_contains_excluded_region,
     parse_angle,
+    parse_ffmpeg_time_seconds,
     parse_probability_threshold,
     resolve_mask_detail_preset,
     select_ffmpeg_error_detail,
@@ -198,67 +203,236 @@ class Insta360FrameExtractorGuiTests(unittest.TestCase):
         self.assertEqual(regions[0], (0, 0, 1024, 1024))
         self.assertEqual(regions[-1], (1536, 1536, 2560, 2560))
 
-    def test_build_ffmpeg_command_uses_v360_and_jpg_sequence(self) -> None:
-        command = build_ffmpeg_command(
+    def merged_command(self, directions=None, **kwargs) -> list[str]:
+        options = dict(
             ffmpeg_path="ffmpeg",
             input_video=Path("C:/input/video.mp4"),
             output_dir=Path("C:/output"),
             video_stem="video",
-            direction=Direction(yaw=45.0, pitch=-10.0),
-            direction_idx=3,
-            direction_count=8,
+            directions=directions if directions is not None else [Direction(yaw=45.0, pitch=-10.0)],
             fps=2.0,
             fov=100.0,
             width=1600,
             height=900,
         )
+        options.update(kwargs)
+        return build_merged_ffmpeg_command(**options)
 
-        self.assertIn("fps=2", command[7])
-        self.assertIn("v360=input=equirect:output=flat", command[7])
-        self.assertIn("interp=cubic", command[7])
-        self.assertIn("h_fov=100", command[7])
-        self.assertIn("v_fov=67.672748", command[7])
-        self.assertIn("setsar=1", command[7])
-        self.assertIn("yaw=45", command[7])
-        self.assertIn("pitch=-10", command[7])
-        self.assertEqual(command[-1].replace("\\", "/"), "C:/output/video_%04d_03.jpg")
+    @staticmethod
+    def output_groups(command: list[str]) -> list[tuple[str, list[str]]]:
+        """(map ラベル, その出力の引数) に切り分ける。index 決め打ちの assert を避ける。"""
+        groups: list[tuple[str, list[str]]] = []
+        index = 0
+        while index < len(command):
+            if command[index] == "-map":
+                label = command[index + 1]
+                args: list[str] = []
+                index += 2
+                while index < len(command) and command[index] != "-map":
+                    args.append(command[index])
+                    index += 1
+                groups.append((label, args))
+            else:
+                index += 1
+        return groups
 
-    def test_build_ffmpeg_command_adds_cuda_decode_when_requested(self) -> None:
-        command = build_ffmpeg_command(
-            ffmpeg_path="ffmpeg",
-            input_video=Path("C:/input/video.mp4"),
-            output_dir=Path("C:/output"),
-            video_stem="video",
-            direction=Direction(yaw=45.0, pitch=-10.0),
-            direction_idx=3,
-            direction_count=8,
-            fps=2.0,
-            fov=100.0,
-            width=1600,
-            height=900,
+    @staticmethod
+    def graph_of(command: list[str]) -> str:
+        return command[command.index("-filter_complex") + 1]
+
+    def test_shared_decode_head_orders_stages_by_cost(self) -> None:
+        self.assertEqual(
+            build_shared_decode_head(2, 0.5, use_gpu_decode=False, reverse_video=False),
+            "[0:v]fps=0.5,split=2[s0][s1]",
+        )
+        self.assertEqual(
+            build_shared_decode_head(2, 0.5, use_gpu_decode=True, reverse_video=False),
+            "[0:v]fps=0.5,hwdownload,format=nv12,split=2[s0][s1]",
+        )
+        self.assertEqual(
+            build_shared_decode_head(1, 24.0, use_gpu_decode=False, reverse_video=True),
+            "[0:v]fps=24,reverse,split=1[s0]",
+        )
+        self.assertEqual(
+            build_shared_decode_head(3, 1.5, use_gpu_decode=True, reverse_video=True),
+            "[0:v]fps=1.5,hwdownload,format=nv12,reverse,split=3[s0][s1][s2]",
+        )
+
+    def test_direction_filter_graph_reports_its_output_pads(self) -> None:
+        graph, outputs = build_direction_filter_graph(
+            generate_ring_directions(4, 0.0), 1.0, 90.0, 1024, 1024
+        )
+        self.assertEqual(outputs, [("[e0]", 0), ("[e1]", 1), ("[e2]", 2), ("[e3]", 3)])
+        self.assertEqual(graph.count(";"), 4)
+
+        _, parity_outputs = build_direction_filter_graph(
+            generate_ring_directions(4, 0.0), 1.0, 90.0, 1024, 1024,
+            reverse_direction_index_on_odd=True,
+        )
+        self.assertEqual(
+            parity_outputs,
+            [("[e0]", 0), ("[o0]", 3), ("[e1]", 1), ("[o1]", 2),
+             ("[e2]", 2), ("[o2]", 1), ("[e3]", 3), ("[o3]", 0)],
+        )
+
+    def test_merged_command_decodes_once_and_fans_out_to_every_direction(self) -> None:
+        directions = generate_ring_directions(8, 0.0)
+        command = self.merged_command(directions=directions)
+        graph = self.graph_of(command)
+
+        # デコード段は 1 本だけ。方向ごとに立てていた頃は N 回フルデコードしていた。
+        self.assertEqual(graph.count("[0:v]"), 1)
+        self.assertEqual(graph.count("split=8"), 1)
+        self.assertEqual(graph.count("v360=input=equirect:output=flat"), 8)
+        self.assertEqual(graph.count("interp=cubic"), 8)
+        self.assertEqual(graph.count("setsar=1"), 8)
+        self.assertIn("h_fov=100", graph)
+        self.assertIn("v_fov=67.672748", graph)
+
+        groups = self.output_groups(command)
+        self.assertEqual(len(groups), 8)
+        self.assertEqual([label for label, _ in groups], [f"[e{i}]" for i in range(8)])
+        self.assertEqual(
+            [args[-1].replace("\\", "/") for _, args in groups],
+            [f"C:/output/video_%04d_{i:02d}.jpg" for i in range(8)],
+        )
+
+    def test_merged_command_sets_the_options_every_output_needs(self) -> None:
+        command = self.merged_command(directions=generate_ring_directions(3, 0.0))
+        for label, args in self.output_groups(command):
+            with self.subTest(label=label):
+                # select を挟むと passthrough なしで同じ絵が複数ファイルに書かれる。
+                self.assertIn("-fps_mode", args)
+                self.assertEqual(args[args.index("-fps_mode") + 1], "passthrough")
+                self.assertIn("-frame_pts", args)
+                self.assertEqual(args[args.index("-frame_pts") + 1], "1")
+                self.assertIn("-atomic_writing", args)
+                self.assertEqual(args[args.index("-atomic_writing") + 1], "1")
+                self.assertEqual(args[args.index("-q:v") + 1], "2")
+                self.assertEqual(args[args.index("-threads:v") + 1], "1")
+        # 一時ディレクトリ経由をやめたので -start_number は使わない。
+        self.assertNotIn("-start_number", command)
+
+    def test_merged_command_orders_the_shared_head_for_memory_safety(self) -> None:
+        graph = self.graph_of(
+            self.merged_command(
+                directions=generate_ring_directions(4, 0.0),
+                use_gpu_decode=True,
+                reverse_video=True,
+            )
+        )
+        head = graph.split(";")[0]
+        # fps -> hwdownload,format -> reverse -> split の順序が崩れると
+        # 転送量が 48 倍になったり VRAM / ホスト RAM が飛ぶ。
+        self.assertEqual(
+            head,
+            "[0:v]fps=2,hwdownload,format=nv12,reverse,split=4[s0][s1][s2][s3]",
+        )
+
+    def test_merged_command_adds_cuda_decode_when_requested(self) -> None:
+        command = self.merged_command(use_gpu_decode=True)
+        self.assertEqual(command[3:7], ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+        self.assertIn("hwdownload,format=nv12", self.graph_of(command))
+
+        cpu_command = self.merged_command(use_gpu_decode=False)
+        self.assertNotIn("-hwaccel", cpu_command)
+        self.assertNotIn("hwdownload", self.graph_of(cpu_command))
+
+    def test_merged_command_drops_frames_before_downloading_them(self) -> None:
+        graph = self.graph_of(self.merged_command(use_gpu_decode=True))
+        self.assertLess(graph.index("fps=2"), graph.index("hwdownload"))
+
+    def test_merged_command_splits_parities_into_their_final_suffixes(self) -> None:
+        directions = generate_ring_directions(4, 0.0)
+        command = self.merged_command(
+            directions=directions,
+            reverse_direction_index_on_odd=True,
+        )
+        graph = self.graph_of(command)
+        # カンマを含む式は filter_complex でエスケープが要るので使わない。
+        self.assertNotIn("mod(", graph)
+        self.assertEqual(graph.count("select=not(n-2*trunc(n/2))"), 4)
+        self.assertEqual(graph.count("select=n-2*trunc(n/2)"), 4)
+
+        groups = self.output_groups(command)
+        self.assertEqual(len(groups), 8)
+        produced = {}
+        for label, args in groups:
+            produced[label] = args[-1].replace("\\", "/")
+        for index in range(4):
+            even_expected = build_output_image_path(
+                Path("C:/output"), "video", 0, index, 4, reverse_on_odd_frames=True
+            )
+            odd_expected = build_output_image_path(
+                Path("C:/output"), "video", 1, index, 4, reverse_on_odd_frames=True
+            )
+            # ffmpeg が書くパターンは、旧実装のリネーム結果と同じサフィックスになる。
+            self.assertTrue(produced[f"[e{index}]"].endswith(f"_{index:02d}.jpg"))
+            self.assertEqual(even_expected.name.rsplit("_", 1)[1], f"{index:02d}.jpg")
+            self.assertTrue(produced[f"[o{index}]"].endswith(f"_{3 - index:02d}.jpg"))
+            self.assertEqual(odd_expected.name.rsplit("_", 1)[1], f"{3 - index:02d}.jpg")
+
+    def test_merged_command_shares_one_pattern_for_the_odd_count_centre(self) -> None:
+        # N が奇数だと中央方向は (N-1)-i == i なので両パリティが同じパターンを共有する。
+        # フレーム番号の偶奇が互いに素なので衝突しない。
+        command = self.merged_command(
+            directions=generate_ring_directions(3, 0.0),
+            reverse_direction_index_on_odd=True,
+        )
+        groups = self.output_groups(command)
+        centre = [args[-1] for label, args in groups if label in ("[e1]", "[o1]")]
+        self.assertEqual(len(centre), 2)
+        self.assertEqual(centre[0], centre[1])
+
+    def test_merged_command_without_parity_has_one_output_per_direction(self) -> None:
+        command = self.merged_command(
+            directions=generate_ring_directions(5, 0.0),
+            reverse_direction_index_on_odd=False,
+        )
+        graph = self.graph_of(command)
+        self.assertNotIn("select=", graph)
+        self.assertEqual(len(self.output_groups(command)), 5)
+
+    def test_merged_command_rejects_an_empty_direction_list(self) -> None:
+        with self.assertRaises(ValueError):
+            self.merged_command(directions=[])
+
+    def test_merged_command_stays_within_the_windows_argument_limit(self) -> None:
+        # 15 方向 + parity = 30 出力。これが実運用の最大構成。
+        command = self.merged_command(
+            directions=generate_ring_directions(15, 10.0),
+            reverse_direction_index_on_odd=True,
             use_gpu_decode=True,
         )
+        self.assertEqual(len(self.output_groups(command)), 30)
+        self.assertLess(sum(len(argument) + 1 for argument in command), 30000)
 
-        self.assertEqual(command[3:7], ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
-        self.assertIn("hwdownload,format=nv12", command[11])
+    def test_compute_expected_frame_count_matches_the_fps_filter(self) -> None:
+        # fps フィルタは t = k/fps < duration の k を出すので ceil(duration*fps) 枚。
+        # 実測: 561.791667 s / fps 1.5 -> 843 枚、40.0 s / fps 1.5 -> 60 枚。
+        self.assertEqual(compute_expected_frame_count(561.791667, 1.5), 843)
+        self.assertEqual(compute_expected_frame_count(561.791667, 0.5), 281)
+        # duration*fps がちょうど整数のときに 1 枚多く数えないこと。
+        self.assertEqual(compute_expected_frame_count(40.0, 1.5), 60)
+        self.assertEqual(compute_expected_frame_count(10.0, 1.0), 10)
+        self.assertEqual(compute_expected_frame_count(0.5, 1.0), 1)
+        self.assertIsNone(compute_expected_frame_count(None, 1.0))
+        self.assertIsNone(compute_expected_frame_count(0.0, 1.0))
+        self.assertIsNone(compute_expected_frame_count(10.0, 0.0))
 
-    def test_build_ffmpeg_command_adds_reverse_when_requested(self) -> None:
-        command = build_ffmpeg_command(
-            ffmpeg_path="ffmpeg",
-            input_video=Path("C:/input/video.mp4"),
-            output_dir=Path("C:/output"),
-            video_stem="video",
-            direction=Direction(yaw=45.0, pitch=-10.0),
-            direction_idx=3,
-            direction_count=8,
-            fps=2.0,
-            fov=100.0,
-            width=1600,
-            height=900,
-            reverse_video=True,
-        )
+    def test_parse_ffmpeg_time_seconds_reads_the_stats_line(self) -> None:
+        line = "frame=  10 fps=2.0 q=2.0 size=N/A time=00:01:23.45 bitrate=N/A speed=1.2x"
+        self.assertAlmostEqual(parse_ffmpeg_time_seconds(line), 83.45, places=3)
+        self.assertAlmostEqual(parse_ffmpeg_time_seconds("time=01:00:00.00"), 3600.0, places=3)
+        # 最初の統計行は time=N/A になることがある。
+        self.assertIsNone(parse_ffmpeg_time_seconds("frame=0 fps=0.0 time=N/A"))
+        self.assertIsNone(parse_ffmpeg_time_seconds("Stream #0:0 -> #0:0 (hevc -> mjpeg)"))
 
-        self.assertIn("fps=2,reverse,", command[7])
+    def test_is_ffmpeg_progress_line_only_matches_stats(self) -> None:
+        self.assertTrue(is_ffmpeg_progress_line("frame=  10 fps=2.0 time=00:00:05.00"))
+        self.assertTrue(is_ffmpeg_progress_line("size=N/A time=00:00:05.00"))
+        self.assertFalse(is_ffmpeg_progress_line("[image2 @ 0] Could not open file"))
+        self.assertFalse(is_ffmpeg_progress_line("Conversion failed!"))
 
     def test_generate_ring_directions_evenly_spreads_yaw(self) -> None:
         directions = generate_ring_directions(4, 15.0)

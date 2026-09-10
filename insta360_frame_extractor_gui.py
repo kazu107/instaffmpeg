@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -65,6 +66,12 @@ FFMPEG_USELESS_ERROR_LINES = frozenset({"Conversion failed!"})
 FFMPEG_ERROR_LINE_BUFFER = 24
 FFMPEG_ERROR_DETAIL_LINES = 3
 FFMPEG_ERROR_DETAIL_MAX_CHARS = 500
+FFMPEG_TIME_PATTERN = re.compile(r"\btime=(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
+# Windows のコマンドライン上限は 32767。余裕を持って手前で止める。
+WINDOWS_COMMAND_LENGTH_LIMIT = 30000
+EXTRACTION_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
+# duration 由来の想定枚数は最終フレーム PTS と最大 1 フレームずれる。
+EXTRACTION_FRAME_COUNT_TOLERANCE = 1
 DEFAULT_MASK_DETAIL_LEVEL = "標準"
 DEFAULT_MASK_CONFIDENCE_THRESHOLD = 0.7
 MASK_DETAIL_PRESETS: dict[str, dict[str, int | bool]] = {
@@ -356,25 +363,17 @@ def compute_vertical_fov(horizontal_fov: float, width: int, height: int) -> floa
     return math.degrees(2.0 * math.atan(math.tan(math.radians(horizontal_fov) / 2.0) * aspect_ratio))
 
 
-def build_filter(
+def build_v360_filter(
     direction: Direction,
-    fps: float,
     fov: float,
     width: int,
     height: int,
-    reverse_video: bool = False,
 ) -> str:
     vertical_fov = compute_vertical_fov(fov, width, height)
-    reverse_prefix = "reverse," if reverse_video else ""
     return (
-        "fps={fps},"
-        "{reverse_prefix}"
         "v360=input=equirect:output=flat:interp=cubic:w={width}:h={height}:"
-        "h_fov={fov}:v_fov={v_fov}:yaw={yaw}:pitch={pitch},"
-        "setsar=1"
+        "h_fov={fov}:v_fov={v_fov}:yaw={yaw}:pitch={pitch}"
     ).format(
-        fps=direction_aware_float(fps),
-        reverse_prefix=reverse_prefix,
         width=width,
         height=height,
         fov=direction_aware_float(fov),
@@ -384,77 +383,199 @@ def build_filter(
     )
 
 
-def build_filter_chain(
-    direction: Direction,
-    fps: float,
-    fov: float,
-    width: int,
-    height: int,
-    use_gpu_decode: bool,
-    reverse_video: bool = False,
-) -> str:
-    filter_chain = build_filter(direction, fps, fov, width, height, reverse_video=reverse_video)
-    if use_gpu_decode:
-        return f"hwdownload,format=nv12,{filter_chain}"
-    return filter_chain
-
-
-def build_ffmpeg_command(
-    ffmpeg_path: str,
-    input_video: Path,
-    output_dir: Path,
-    video_stem: str,
-    direction: Direction,
-    direction_idx: int,
+def build_shared_decode_head(
     direction_count: int,
+    fps: float,
+    use_gpu_decode: bool,
+    reverse_video: bool,
+) -> str:
+    """全方向が共有するデコード段。順序が重要。
+
+        fps -> hwdownload,format -> reverse -> split
+
+    - fps を先頭に置くのは、GPU デコード時に破棄するフレームを転送しないため
+      (7680x3840 nv12 = 44.2MB/frame。fps=0.5 なら 48 枚に 1 枚しか要らない)。
+    - hwdownload を reverse より前に置くのは、reverse が全フレームをバッファするため。
+      VRAM 側で溜めると 12GiB のカードでは即 OOM になる。
+    - reverse を split より前に置くのは、分岐後に置くと N 倍のバッファを取るため。
+    """
+    stages = [f"fps={direction_aware_float(fps)}"]
+    if use_gpu_decode:
+        stages.append("hwdownload")
+        stages.append("format=nv12")
+    if reverse_video:
+        stages.append("reverse")
+    stages.append(f"split={direction_count}")
+    labels = "".join(f"[s{index}]" for index in range(direction_count))
+    return "[0:v]" + ",".join(stages) + labels
+
+
+def build_direction_filter_graph(
+    directions: list[Direction],
     fps: float,
     fov: float,
     width: int,
     height: int,
     use_gpu_decode: bool = False,
     reverse_video: bool = False,
-    output_pattern_override: Path | None = None,
+    reverse_direction_index_on_odd: bool = False,
+) -> tuple[str, list[tuple[str, int]]]:
+    """1 回のデコードから全方向を作る filter_complex を組み立てる。
+
+    戻り値は (filter_complex, [(出力パッド, 方向インデックス), ...])。
+
+    奇数フレーム逆順が有効な場合は方向ごとに 2 出力へ分け、`select` で偶数
+    フレームと奇数フレームを振り分ける。奇数フレーム側には (N-1)-i を割り当てる
+    ので、ffmpeg が最終ファイル名をそのまま書ける。
+
+    parity 述語にカンマを使わない (`n-2*trunc(n/2)`) のは、filter_complex 内の
+    カンマがフィルタ区切りと解釈されエスケープが必要になるのを避けるため。
+    """
+    if not directions:
+        raise ValueError("少なくとも1つの書き出し方向を指定してください。")
+
+    direction_count = len(directions)
+    chains = [
+        build_shared_decode_head(direction_count, fps, use_gpu_decode, reverse_video)
+    ]
+    outputs: list[tuple[str, int]] = []
+
+    for index, direction in enumerate(directions):
+        transform = f"{build_v360_filter(direction, fov, width, height)},setsar=1"
+        if reverse_direction_index_on_odd:
+            chains.append(f"[s{index}]{transform},split=2[p{index}e][p{index}o]")
+            chains.append(f"[p{index}e]select=not(n-2*trunc(n/2))[e{index}]")
+            chains.append(f"[p{index}o]select=n-2*trunc(n/2)[o{index}]")
+            outputs.append((f"[e{index}]", index))
+            outputs.append((f"[o{index}]", (direction_count - 1) - index))
+        else:
+            chains.append(f"[s{index}]{transform}[e{index}]")
+            outputs.append((f"[e{index}]", index))
+
+    return ";".join(chains), outputs
+
+
+def build_merged_ffmpeg_command(
+    ffmpeg_path: str,
+    input_video: Path,
+    output_dir: Path,
+    video_stem: str,
+    directions: list[Direction],
+    fps: float,
+    fov: float,
+    width: int,
+    height: int,
+    use_gpu_decode: bool = False,
+    reverse_video: bool = False,
+    reverse_direction_index_on_odd: bool = False,
 ) -> list[str]:
-    filter_chain = build_filter_chain(
-        direction,
+    """全方向を 1 プロセスで書き出すコマンド。
+
+    デコードは 1 回だけ。方向ごとに ffmpeg プロセスを立てていた旧実装は、
+    N 方向で N 回フルデコードしており、実測でも壁時計時間 = デコード時間だった。
+
+    最終ファイル名を image2 に直接書かせるので一時ディレクトリと移動は不要。
+    `-frame_pts 1` の採番は旧実装の `-start_number 0` と一致することを実測済み。
+    """
+    filter_complex, outputs = build_direction_filter_graph(
+        directions,
         fps,
         fov,
         width,
         height,
-        use_gpu_decode,
+        use_gpu_decode=use_gpu_decode,
         reverse_video=reverse_video,
-    )
-    output_pattern = output_pattern_override or build_output_pattern(
-        output_dir,
-        video_stem,
-        direction_idx,
-        direction_count,
+        reverse_direction_index_on_odd=reverse_direction_index_on_odd,
     )
 
-    command = [
-        ffmpeg_path,
-        "-hide_banner",
-        "-y",
-    ]
-
+    command = [ffmpeg_path, "-hide_banner", "-y"]
     if use_gpu_decode:
         command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+    command.extend(["-i", str(input_video), "-an", "-filter_complex", filter_complex])
 
-    command.extend(
-        [
-            "-i",
-            str(input_video),
-            "-an",
-            "-vf",
-            filter_chain,
-            "-q:v",
-            "2",
-            "-start_number",
-            "0",
-            str(output_pattern),
-        ]
-    )
+    direction_count = len(directions)
+    for pad, direction_index in outputs:
+        output_pattern = build_output_pattern(output_dir, video_stem, direction_index, direction_count)
+        command.extend(
+            [
+                "-map",
+                pad,
+                # select を挟むと passthrough なしでは同じ絵が複数ファイルに書かれる。
+                # 症状が rc=0 かつ正しいファイル数なので、絶対に外さないこと。
+                "-fps_mode",
+                "passthrough",
+                "-frame_pts",
+                "1",
+                "-q:v",
+                "2",
+                "-threads:v",
+                "1",
+                # 書き込み途中のファイルは <name>.jpg.tmp になり、
+                # マスク側の {stem}_*.jpg glob からは見えない。
+                "-atomic_writing",
+                "1",
+                str(output_pattern),
+            ]
+        )
+
+    assert_ffmpeg_command_is_shippable(command, outputs)
     return command
+
+
+def assert_ffmpeg_command_is_shippable(command: list[str], outputs: list[tuple[str, int]]) -> None:
+    """出荷前に静的に確かめられる不変条件。"""
+    total_length = sum(len(argument) + 1 for argument in command)
+    if total_length >= WINDOWS_COMMAND_LENGTH_LIMIT:
+        raise ValueError(
+            f"ffmpeg コマンドが Windows の上限に近すぎます ({total_length} 文字)。"
+            "方向数を減らしてください。"
+        )
+    if command.count("-map") != len(outputs):
+        raise AssertionError("出力グループ数が -map の数と一致しません。")
+    if command.count("-fps_mode") != len(outputs):
+        raise AssertionError("全出力に -fps_mode passthrough が必要です。")
+    if command.count("-frame_pts") != len(outputs):
+        raise AssertionError("全出力に -frame_pts 1 が必要です。")
+
+
+def compute_expected_frame_count(duration_seconds: float | None, fps: float) -> int | None:
+    """fps フィルタが 1 方向あたりに出すフレーム数の見積り。
+
+    fps フィルタは t = k/fps (k = 0, 1, ...) の位置にフレームを作り、入力が尽きる
+    まで続く。つまり t < duration を満たす k の個数 = ceil(duration * fps)。
+    duration * fps がちょうど整数のとき floor+1 にすると 1 枚多く数えてしまう
+    (実測: 40.0 s / fps=1.5 で 61 ではなく 60 枚)。
+
+    ここは見積りであって厳密値ではない。実際の枚数は最終フレームの PTS で決まり、
+    コンテナの duration とは最大 1 フレーム間隔ずれる。呼び出し側は
+    EXTRACTION_FRAME_COUNT_TOLERANCE の範囲を許容すること。
+    """
+    if duration_seconds is None or duration_seconds <= 0 or fps <= 0:
+        return None
+    # 浮動小数の僅かな超過で 1 枚増えないよう、ごく小さい値を引いてから切り上げる。
+    return max(1, int(math.ceil(duration_seconds * fps - 1e-9)))
+
+
+def parse_ffmpeg_time_seconds(line: str) -> float | None:
+    """ffmpeg の進捗行から time= を秒に変換する。
+
+    frame= は出力 #0 しか数えないので進捗には使えない (実測: 方向あたり 20 枚
+    書き終えた時点で frame=10)。time= はタイムライン位置なので全出力共通。
+    最初の統計行では time=N/A になることがある。
+    """
+    match = FFMPEG_TIME_PATTERN.search(line)
+    if match is None:
+        return None
+    hours, minutes, seconds = match.group(1), match.group(2), match.group(3)
+    try:
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except ValueError:
+        return None
+
+
+def is_ffmpeg_progress_line(line: str) -> bool:
+    """統計行かどうか。ログペインに毎秒流し込まないために使う。"""
+    return line.startswith("frame=") or line.startswith("size=")
 
 
 def generate_ring_directions(count: int, pitch: float) -> list[Direction]:
@@ -1336,7 +1457,13 @@ class Insta360ExtractorApp:
         ttk.Entry(settings_frame, width=12, textvariable=self.height_var).grid(row=0, column=7, sticky="w", pady=6)
 
         settings_label("並列数", 1, 0)
-        ttk.Entry(settings_frame, width=12, textvariable=self.parallelism_var).grid(row=1, column=1, sticky="w", pady=6)
+        parallelism_group = settings_group(1, 1)
+        # 抽出は 1 プロセスで全方向を書き出すようになったので、この値は使われない。
+        # 保存済み設定との互換のため変数と検証は残し、UI では無効化して理由を示す。
+        parallelism_entry = ttk.Entry(parallelism_group, width=6, textvariable=self.parallelism_var)
+        parallelism_entry.pack(side="left")
+        parallelism_entry.state(["disabled"])
+        ttk.Label(parallelism_group, text="単一デコードのため未使用").pack(side="left", padx=(8, 0))
 
         settings_label("GPU", 1, 2)
         gpu_group = settings_group(1, 3)
@@ -3428,7 +3555,6 @@ class Insta360ExtractorApp:
         self._append_log("=== 抽出を開始します ===")
         planned_directions = options["directions"]
         assert isinstance(planned_directions, list)
-        parallelism = min(int(options["parallelism"]), len(planned_directions)) if run_extract else 0
         gpu_text = "CUDA ON" if bool(options["use_gpu_decode"]) else "CUDA OFF"
         reverse_text = "逆再生 ON" if bool(options["reverse_video"]) else "逆再生 OFF"
         mode_text = (
@@ -3439,15 +3565,16 @@ class Insta360ExtractorApp:
         mask_text = "SegFormerマスク ON" if run_masks else "SegFormerマスク OFF"
         detail_text = f"細かさ={options['mask_detail_level']}"
         threshold_text = f"しきい値={direction_aware_float(float(options['mask_confidence_threshold']))}"
-        mask_parallel_text = f"マスク並列={options['mask_parallelism']}"
+        mask_parallel_text = f"マスクバッチ={options['mask_parallelism']}"
         category_text = "対象=" + ",".join(
             MASK_CATEGORY_DISPLAY_NAMES.get(category, category) for category in options["mask_categories"]
         )
         naming_text = "奇数逆順 ON" if bool(options["reverse_direction_index_on_odd"]) else "奇数逆順 OFF"
+        extract_text = f"単一デコード{len(planned_directions)}方向同時" if run_extract else "抽出なし"
         self.status_var.set(
             f"{mode_text} を開始しました。"
-            f"{gpu_text} / {reverse_text} / {naming_text} / {mask_text} / {mask_parallel_text} / "
-            f"{detail_text} / {threshold_text} / {category_text}"
+            f"{extract_text} / {gpu_text} / {reverse_text} / {naming_text} / {mask_text} / "
+            f"{mask_parallel_text} / {detail_text} / {threshold_text} / {category_text}"
         )
         self.worker_thread = threading.Thread(target=self._run_extraction, args=(options,), daemon=True)
         self.worker_thread.start()
@@ -3582,7 +3709,6 @@ class Insta360ExtractorApp:
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
             total = len(directions)
-            parallelism = max(1, min(requested_parallelism, total)) if run_extract else 0
             mask_parallelism = max(1, requested_mask_parallelism)
             gpu_text = "ON" if use_gpu_decode else "OFF"
             reverse_text = "ON" if reverse_video else "OFF"
@@ -3599,84 +3725,69 @@ class Insta360ExtractorApp:
             self.log_queue.put(
                 (
                     "log",
-                    f"実行内容: {mode_text} | 並列数: {parallelism if run_extract else 0} | GPUデコード: {gpu_text} | 逆再生: {reverse_text} | "
-                    f"奇数フレーム方向index逆順: {naming_text} | "
-                    f"SegFormerマスク: {mask_text} | マスク並列数: {mask_parallelism} | 細かさ: {detail_text} | "
+                    f"実行内容: {mode_text} | 抽出: 単一デコード{total}方向同時 | GPUデコード: {gpu_text} | "
+                    f"逆再生: {reverse_text} | 奇数フレーム方向index逆順: {naming_text} | "
+                    f"SegFormerマスク: {mask_text} | マスクバッチ数: {mask_parallelism} | 細かさ: {detail_text} | "
                     f"除外しきい値: {threshold_text} | 対象: {categories_text}",
                 )
             )
 
+            extracted_this_run = False
             if run_extract:
                 assert input_video is not None
                 assert video_stem is not None
-
-                work_queue: queue.Queue[tuple[int, Direction]] = queue.Queue()
-                for index, direction in enumerate(directions):
+                for direction in directions:
                     assert isinstance(direction, Direction)
-                    work_queue.put((index, direction))
 
-                completed = 0
-                completed_lock = threading.Lock()
-                errors: list[str] = []
-                errors_lock = threading.Lock()
+                expected_frames = compute_expected_frame_count(
+                    self._probe_duration_seconds(input_video),
+                    fps,
+                )
+                if expected_frames is None:
+                    self.log_queue.put(
+                        ("log", "動画の長さを取得できなかったため、進捗はフレーム数なしで表示します。")
+                    )
+                else:
+                    self.log_queue.put(
+                        ("log", f"想定出力: {expected_frames} フレーム x {total} 方向 = {expected_frames * total} 枚")
+                    )
 
-                def worker() -> None:
-                    nonlocal completed
+                status, detail = self._run_merged_extraction(
+                    ffmpeg_path=ffmpeg_path,
+                    input_video=input_video,
+                    output_dir=output_dir,
+                    video_stem=video_stem,
+                    directions=directions,
+                    fps=fps,
+                    fov=fov,
+                    width=width,
+                    height=height,
+                    use_gpu_decode=use_gpu_decode,
+                    reverse_video=reverse_video,
+                    reverse_direction_index_on_odd=reverse_direction_index_on_odd,
+                    expected_frames=expected_frames,
+                )
 
-                    while not self.stop_requested.is_set():
-                        try:
-                            index, direction = work_queue.get_nowait()
-                        except queue.Empty:
-                            return
-
-                        try:
-                            job_status, detail = self._run_direction_job(
-                                ffmpeg_path=ffmpeg_path,
-                                input_video=input_video,
-                                output_dir=output_dir,
-                                video_stem=video_stem,
-                                direction=direction,
-                                index=index,
-                                total=total,
-                                fps=fps,
-                                fov=fov,
-                                width=width,
-                                height=height,
-                                use_gpu_decode=use_gpu_decode,
-                                reverse_video=reverse_video,
-                                reverse_direction_index_on_odd=reverse_direction_index_on_odd,
-                            )
-
-                            if job_status == "ok":
-                                with completed_lock:
-                                    completed += 1
-                                    self.log_queue.put(("log", f"完了: {completed}/{total}"))
-                            elif job_status == "error":
-                                with errors_lock:
-                                    if not errors and detail:
-                                        errors.append(detail)
-                                self.stop_requested.set()
-                                self._terminate_active_processes()
-                                return
-                            else:
-                                return
-                        finally:
-                            work_queue.task_done()
-
-                workers = [threading.Thread(target=worker, daemon=True) for _ in range(parallelism)]
-                for worker_thread in workers:
-                    worker_thread.start()
-                for worker_thread in workers:
-                    worker_thread.join()
-
-                if errors:
-                    self.log_queue.put(("error", errors[0]))
+                if status == "error":
+                    self.log_queue.put(("error", detail or "抽出に失敗しました。"))
                     return
-                if self.stop_requested.is_set():
+                if status == "stopped" or self.stop_requested.is_set():
                     self.log_queue.put(("status", "停止しました。"))
                     return
 
+                mismatch = self._verify_extracted_output(
+                    output_dir, video_stem, total, expected_frames
+                )
+                if mismatch is not None:
+                    # ここで止めないと、途中で切れた出力に対してマスクを作ってしまう。
+                    self.log_queue.put(("error", mismatch))
+                    return
+
+                self.log_queue.put(("log", f"抽出完了: {total} 方向"))
+                extracted_this_run = True
+
             if run_masks:
+                self._warn_about_orphaned_masks(output_dir, video_stem)
                 self._generate_segformer_masks(
                     output_dir,
                     video_stem,
@@ -3736,45 +3847,46 @@ class Insta360ExtractorApp:
         if not self.stop_requested.is_set():
             self.log_queue.put(("log", "SegFormerマスク生成が完了しました。"))
 
-    def _finalize_direction_outputs(
-        self,
-        temp_output_dir: Path,
-        output_dir: Path,
-        video_stem: str,
-        direction_idx: int,
-        direction_count: int,
-        reverse_direction_index_on_odd: bool,
-    ) -> None:
-        for temp_image_path in sorted(temp_output_dir.glob("*.jpg")):
-            if self.stop_requested.is_set():
-                return
+    def _probe_duration_seconds(self, input_video: Path) -> float | None:
+        """抽出用に動画の長さを取得する。
 
+        self.preview_metadata はプレビューを読んだ時しか埋まらず _clear_preview で
+        None に戻るので当てにできない。_collect_options も ffprobe を解決しない。
+        取れなければ None を返し、進捗はフレーム数なしで表示する。
+        """
+        ffprobe_path = shutil.which("ffprobe")
+        if ffprobe_path is None:
+            return None
+        try:
+            metadata = probe_video_metadata(input_video, ffprobe_path)
+        except Exception as error:
+            self.log_queue.put(("log", f"動画の長さを取得できませんでした: {error}"))
+            return None
+        return metadata.duration_seconds
+
+    def _sweep_incomplete_outputs(self, output_dir: Path) -> int:
+        """`-atomic_writing` の書きかけファイルを掃除する。
+
+        強制終了やクラッシュで残ると次回以降ずっと居座るため、実行開始時に消す。
+        """
+        removed = 0
+        if not output_dir.is_dir():
+            return removed
+        for leftover in output_dir.glob("*.jpg.tmp"):
             try:
-                frame_index = int(temp_image_path.stem)
-            except ValueError as exc:
-                raise RuntimeError(f"一時出力ファイル名の解析に失敗しました: {temp_image_path.name}") from exc
+                leftover.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
 
-            final_image_path = build_output_image_path(
-                output_dir,
-                video_stem,
-                frame_index,
-                direction_idx,
-                direction_count,
-                reverse_on_odd_frames=reverse_direction_index_on_odd,
-            )
-            if final_image_path.exists():
-                final_image_path.unlink()
-            shutil.move(str(temp_image_path), str(final_image_path))
-
-    def _run_direction_job(
+    def _run_merged_extraction(
         self,
         ffmpeg_path: str,
         input_video: Path,
         output_dir: Path,
         video_stem: str,
-        direction: Direction,
-        index: int,
-        total: int,
+        directions: list[Direction],
         fps: float,
         fov: float,
         width: int,
@@ -3782,91 +3894,158 @@ class Insta360ExtractorApp:
         use_gpu_decode: bool,
         reverse_video: bool,
         reverse_direction_index_on_odd: bool,
+        expected_frames: int | None,
     ) -> tuple[str, str | None]:
-        even_output_path = build_output_image_path(
-            output_dir,
-            video_stem,
-            0,
-            index,
-            total,
-            reverse_on_odd_frames=False,
-        )
-        odd_output_path = build_output_image_path(
-            output_dir,
-            video_stem,
-            1,
-            index,
-            total,
-            reverse_on_odd_frames=reverse_direction_index_on_odd,
-        )
-        label = f"[{index + 1}/{total}]"
-        self.log_queue.put(
-            (
-                "log",
-                f"{label} yaw={direction_aware_float(direction.yaw)}, "
-                f"pitch={direction_aware_float(direction.pitch)} -> even:{even_output_path.name} odd:{odd_output_path.name}",
+        """1 プロセスで全方向を書き出す。CUDA が駄目なら CPU デコードで再試行。"""
+        total = len(directions)
+        removed = self._sweep_incomplete_outputs(output_dir)
+        if removed:
+            self.log_queue.put(("log", f"書きかけの一時ファイルを {removed} 件削除しました。"))
+
+        for index, direction in enumerate(directions):
+            suffix_even = compute_output_direction_index(index, total, 0)
+            suffix_odd = compute_output_direction_index(
+                index, total, 1, reverse_on_odd_frames=reverse_direction_index_on_odd
             )
-        )
+            width_suffix = direction_index_width(total)
+            self.log_queue.put(
+                (
+                    "log",
+                    f"方向{index}: yaw={direction_aware_float(direction.yaw)}, "
+                    f"pitch={direction_aware_float(direction.pitch)} -> "
+                    f"偶数フレーム _{suffix_even:0{width_suffix}d} / "
+                    f"奇数フレーム _{suffix_odd:0{width_suffix}d}",
+                )
+            )
 
         attempts = [use_gpu_decode]
         if use_gpu_decode:
             attempts.append(False)
 
-        with tempfile.TemporaryDirectory(prefix="insta360_extract_") as temp_output_dir_str:
-            temp_output_dir = Path(temp_output_dir_str)
-            temp_output_pattern = temp_output_dir / "%04d.jpg"
+        last_detail: str | None = None
+        for attempt_index, gpu_attempt in enumerate(attempts):
+            if self.stop_requested.is_set():
+                return "stopped", None
 
-            for attempt_index, gpu_attempt in enumerate(attempts):
-                if self.stop_requested.is_set():
-                    return "stopped", None
+            if gpu_attempt:
+                self.log_queue.put(("log", f"CUDAデコード + 単一デコード{total}方向同時書き出しで開始"))
+            elif use_gpu_decode and attempt_index > 0:
+                self.log_queue.put(("log", "CUDAデコードに失敗したためCPUデコードで再試行"))
+            else:
+                self.log_queue.put(("log", f"CPUデコード + 単一デコード{total}方向同時書き出しで開始"))
 
-                for temp_image_path in temp_output_dir.glob("*.jpg"):
-                    temp_image_path.unlink()
+            command = build_merged_ffmpeg_command(
+                ffmpeg_path=ffmpeg_path,
+                input_video=input_video,
+                output_dir=output_dir,
+                video_stem=video_stem,
+                directions=directions,
+                fps=fps,
+                fov=fov,
+                width=width,
+                height=height,
+                use_gpu_decode=gpu_attempt,
+                reverse_video=reverse_video,
+                reverse_direction_index_on_odd=reverse_direction_index_on_odd,
+            )
+            status, detail = self._run_ffmpeg_process(
+                0,
+                "[抽出]",
+                command,
+                expected_frames=expected_frames,
+                fps=fps,
+            )
+            if status == "ok":
+                return "ok", None
+            if status == "stopped":
+                return "stopped", None
+            last_detail = detail
+            if not gpu_attempt:
+                return "error", detail
 
-                if gpu_attempt:
-                    self.log_queue.put(("log", f"{label} CUDAデコードで開始"))
-                elif use_gpu_decode and attempt_index > 0:
-                    self.log_queue.put(("log", f"{label} CUDAデコードに失敗したためCPUデコードで再試行"))
+        return "error", last_detail or "抽出に失敗しました。"
 
-                command = build_ffmpeg_command(
-                    ffmpeg_path=ffmpeg_path,
-                    input_video=input_video,
-                    output_dir=output_dir,
-                    video_stem=video_stem,
-                    direction=direction,
-                    direction_idx=index,
-                    direction_count=total,
-                    fps=fps,
-                    fov=fov,
-                    width=width,
-                    height=height,
-                    use_gpu_decode=gpu_attempt,
-                    reverse_video=reverse_video,
-                    output_pattern_override=temp_output_pattern,
+    def _warn_about_orphaned_masks(self, output_dir: Path, video_stem: str | None) -> None:
+        """元画像が消えたマスクが残っていないか警告する。
+
+        _save_mask_array は新しいマスクが空の時にしか unlink しないので、
+        前回より短いランを行うと過去のマスクが残り続ける。消すのは利用者の判断
+        なので、ここでは件数を知らせるだけにする。
+        """
+        if not output_dir.is_dir():
+            return
+        pattern = f"{glob.escape(video_stem)}_*.jpg.mask.png" if video_stem else "*.jpg.mask.png"
+        orphans = [
+            mask_path
+            for mask_path in output_dir.glob(pattern)
+            if not mask_path.with_suffix("").is_file()
+        ]
+        if orphans:
+            self.log_queue.put(
+                (
+                    "log",
+                    f"警告: 元画像が存在しないマスクが {len(orphans)} 件あります"
+                    f" (例: {orphans[0].name})。過去の実行の残りである可能性があります。",
                 )
-                status, detail = self._run_ffmpeg_process(index, label, command)
-                if status == "ok":
-                    self._finalize_direction_outputs(
-                        temp_output_dir,
-                        output_dir,
-                        video_stem,
-                        index,
-                        total,
-                        reverse_direction_index_on_odd=reverse_direction_index_on_odd,
-                    )
-                    return "ok", None
-                if status == "stopped":
-                    return "stopped", None
-                if not gpu_attempt:
-                    return "error", detail
+            )
 
-        return "error", f"{label} の処理に失敗しました。"
+    def _verify_extracted_output(
+        self,
+        output_dir: Path,
+        video_stem: str,
+        direction_count: int,
+        expected_frames: int | None,
+    ) -> str | None:
+        """方向ごとのファイル数を検算する。合わなければ理由を返す。
+
+        1 プロセス化すると失敗が全方向を同じフレームで打ち切るため、
+        「出力が途中で終わっている」ことがディレクトリを見ただけでは分からない。
+        マスク段は出力ディレクトリを信用して glob するので、その前に必ず確かめる。
+        """
+        suffix_width = direction_index_width(direction_count)
+        counts: dict[str, int] = {}
+        for direction_index in range(direction_count):
+            suffix = f"{direction_index:0{suffix_width}d}"
+            counts[suffix] = len(list(output_dir.glob(f"{glob.escape(video_stem)}_*_{suffix}.jpg")))
+
+        # まず方向間で枚数が揃っているか。ここが崩れるのは書き出しの取りこぼし。
+        distinct_counts = sorted(set(counts.values()))
+        if len(distinct_counts) != 1:
+            detail = ", ".join(f"_{suffix}: {count}" for suffix, count in sorted(counts.items()))
+            return f"方向ごとの出力枚数が揃っていません ({detail})"
+
+        produced = distinct_counts[0]
+        if produced == 0:
+            return "出力画像が 1 枚も作られていません。"
+        if expected_frames is None:
+            return None
+
+        # duration 由来の想定値は最大 1 フレームずれるので、その範囲は許容する。
+        # ここで誤って弾くと正常なジョブがマスク生成前に止まってしまう。
+        difference = abs(produced - expected_frames)
+        if difference > EXTRACTION_FRAME_COUNT_TOLERANCE:
+            return (
+                f"抽出結果の枚数が想定と大きく異なります "
+                f"(方向あたり {produced} 枚 / 想定 {expected_frames} 枚)。"
+                "処理が途中で終わっていないか確認してください。"
+            )
+        if difference:
+            self.log_queue.put(
+                (
+                    "log",
+                    f"注記: 方向あたり {produced} 枚 (duration からの想定 {expected_frames} 枚)。"
+                    "1 フレーム差はコンテナの duration 誤差の範囲です。",
+                )
+            )
+        return None
 
     def _run_ffmpeg_process(
         self,
         process_key: int,
         label: str,
         command: list[str],
+        expected_frames: int | None = None,
+        fps: float | None = None,
     ) -> tuple[str, str | None]:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(
@@ -3881,6 +4060,8 @@ class Insta360ExtractorApp:
         self._register_process(process_key, process)
 
         recent_lines: list[str] = []
+        reported_frames = -1
+        last_progress_at = 0.0
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -3894,6 +4075,26 @@ class Insta360ExtractorApp:
                 recent_lines.append(cleaned)
                 if len(recent_lines) > FFMPEG_ERROR_LINE_BUFFER:
                     recent_lines.pop(0)
+
+                if is_ffmpeg_progress_line(cleaned):
+                    # 統計行は毎秒 2 回程度届く。19 分のジョブでは 2000 行を超え、
+                    # ログペインは trim しないので生のままは流さない。
+                    if expected_frames is None or fps is None or fps <= 0:
+                        continue
+                    elapsed_media = parse_ffmpeg_time_seconds(cleaned)
+                    if elapsed_media is None:
+                        continue
+                    done = min(expected_frames, int(math.floor(elapsed_media * fps)) + 1)
+                    now = time.monotonic()
+                    if done <= reported_frames:
+                        continue
+                    if now - last_progress_at < EXTRACTION_PROGRESS_MIN_INTERVAL_SECONDS:
+                        continue
+                    reported_frames = done
+                    last_progress_at = now
+                    self.log_queue.put(("log", f"{label} 抽出中: {done}/{expected_frames} フレーム"))
+                    continue
+
                 self.log_queue.put(("log", f"{label} {cleaned}"))
 
             return_code = process.wait()

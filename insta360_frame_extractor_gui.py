@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import glob
 import json
 import math
@@ -52,8 +53,22 @@ MASK_CATEGORY_DISPLAY_NAMES: dict[str, str] = {
     "car": "車",
     "tree": "木",
 }
-MASK_BATCH_SIZE_LIMIT = 8
+# 実測アクティベーション (512x512, logits+softmax+interpolate+threshold, allocated/reserved):
+#   B=9 1381/1436 MiB, B=16 2437/2520, B=18 2738/2830, B=32 4851/5000
+# GPU0 は表示 GPU で常時 2.7GiB 使用。2 スレッド x B=18 + CUDA コンテキスト +
+# 8K NVDEC セッションで 12.29GiB の大半を使うため、32 ではなく 18 で止める。
+MASK_BATCH_SIZE_LIMIT = 18
+DEFAULT_MASK_BATCH_SIZE = 9
 MASK_PNG_COMPRESS_LEVEL = 2
+MASK_PRECISION_CHOICES = ("fp16", "fp32")
+DEFAULT_MASK_PRECISION = "fp16"
+# 推論と CPU 側 (JPEG デコード / PNG 書き込み) を重ねるためのワーカー数。
+# 実測では 2 で飽和 (t2 1.522s vs t3 1.562s)。
+MASK_DECODE_WORKERS = 3
+MASK_WRITE_WORKERS = 4
+MASK_WORKERS_PER_DEVICE = 2
+JPEG_EOI_MARKER = b"\xff\xd9"
+JPEG_EOI_SEARCH_BYTES = 1024
 SETTINGS_COLUMN_COUNT = 8
 # ffmpeg は本当の原因を数行前に出し、最終行は "Conversion failed!" のような
 # 無情報な要約になることが多い。原因になり得る行だけを拾うためのパターン。
@@ -72,6 +87,7 @@ WINDOWS_COMMAND_LENGTH_LIMIT = 30000
 EXTRACTION_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
 # duration 由来の想定枚数は最終フレーム PTS と最大 1 フレームずれる。
 EXTRACTION_FRAME_COUNT_TOLERANCE = 1
+MASK_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
 DEFAULT_MASK_DETAIL_LEVEL = "標準"
 DEFAULT_MASK_CONFIDENCE_THRESHOLD = 0.7
 MASK_DETAIL_PRESETS: dict[str, dict[str, int | bool]] = {
@@ -305,6 +321,33 @@ def collect_segformer_excluded_label_ids(id2label: dict[int, str]) -> set[int]:
     for label_ids in label_groups.values():
         excluded_label_ids.update(label_ids)
     return excluded_label_ids
+
+
+def load_image_bgr(image_path: Path) -> object:
+    """JPEG を BGR uint8 で読む。
+
+    `cv2.imread` は使えない。理由が 2 つある。
+      1. 非 ASCII パスで黙って None を返す (cv2 5.0.0 で実測。このアプリは
+         日本語 GUI で、出力先も動画名もユーザー入力なので現実的な経路)。
+      2. 途中まで書かれた JPEG に対して None も例外も返さず、欠損部がゴミの
+         完全サイズ配列を返す (5% / 50% / 90% / 99.9% 切り詰めで実測)。
+    そこで np.fromfile で読み、EOI マーカーを確かめてから imdecode する。
+    """
+    import numpy as np
+
+    cv2 = get_cv2()
+    raw = np.fromfile(str(image_path), dtype=np.uint8)
+    if raw.size < 4:
+        raise RuntimeError(f"画像が空か小さすぎます: {image_path}")
+
+    tail = raw[-JPEG_EOI_SEARCH_BYTES:].tobytes()
+    if not tail.endswith(JPEG_EOI_MARKER) and JPEG_EOI_MARKER not in tail:
+        raise RuntimeError(f"JPEG が不完全です (書き込み途中の可能性): {image_path}")
+
+    bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise RuntimeError(f"JPEG のデコードに失敗しました: {image_path}")
+    return bgr
 
 
 def build_binary_usage_mask(
@@ -1025,7 +1068,13 @@ def extract_preview_proxy_video(
 
 
 class SegFormerMaskGenerator:
-    def __init__(self, model_id: str = SEGFORMER_MODEL_ID) -> None:
+    def __init__(
+        self,
+        model_id: str = SEGFORMER_MODEL_ID,
+        device: str | None = None,
+        precision: str = DEFAULT_MASK_PRECISION,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> None:
         try:
             import numpy as np
             import torch
@@ -1041,10 +1090,26 @@ class SegFormerMaskGenerator:
         self.torch = torch
         self.Image = Image
         self.model_id = model_id
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.log_callback = log_callback
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.image_processor = SegformerImageProcessor.from_pretrained(model_id)
         self.model = AutoModelForSemanticSegmentation.from_pretrained(model_id).to(self.device)
         self.model.eval()
+
+        # fp16 は CUDA 専用。CPU の half は破滅的に遅い。
+        self.use_fp16 = precision == "fp16" and self.device.type == "cuda"
+        self.model_fp16 = None
+        if self.use_fp16:
+            # fp32 の重みも残す。fp16 で非有限が出たバッチを fp32 でやり直すため。
+            # segformer-b0 は 14.3 MiB なので 2 本持っても無視できる。
+            self.model_fp16 = copy.deepcopy(self.model).half()
+            self.model_fp16.eval()
+
+        self._configure_preprocessing()
 
         raw_id2label = getattr(self.model.config, "id2label", {})
         self.id2label = {int(label_id): str(label_name) for label_id, label_name in raw_id2label.items()}
@@ -1053,8 +1118,62 @@ class SegFormerMaskGenerator:
         if not self.excluded_label_ids:
             raise RuntimeError("SegFormer のラベルから sky / person / car / tree を解決できませんでした。")
 
+        self._decode_pool: object | None = None
+        self._write_pool: object | None = None
+        self._pool_lock = threading.Lock()
+        self.non_finite_batches = 0
+
+    def _configure_preprocessing(self) -> None:
+        """前処理の定数を image_processor から読み出して GPU 側に用意する。
+
+        値をハードコードせず processor に合わせることで、モデルを差し替えても
+        前処理が食い違わないようにする。
+        """
+        processor = self.image_processor
+        size = getattr(processor, "size", None) or {}
+        self.input_height = int(size.get("height", 512))
+        self.input_width = int(size.get("width", 512))
+        self.rescale_factor = float(getattr(processor, "rescale_factor", 1.0 / 255.0))
+        mean = list(getattr(processor, "image_mean", [0.485, 0.456, 0.406]))
+        std = list(getattr(processor, "image_std", [0.229, 0.224, 0.225]))
+        self.mean_tensor = self.torch.tensor(mean, dtype=self.torch.float32, device=self.device).view(1, 3, 1, 1)
+        self.std_tensor = self.torch.tensor(std, dtype=self.torch.float32, device=self.device).view(1, 3, 1, 1)
+
     def device_label(self) -> str:
         return str(self.device)
+
+    def precision_label(self) -> str:
+        return "fp16" if self.use_fp16 else "fp32"
+
+    def _log(self, message: str) -> None:
+        if self.log_callback is not None:
+            self.log_callback(message)
+
+    def _pools(self) -> tuple[object, object]:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with self._pool_lock:
+            if self._decode_pool is None:
+                self._decode_pool = ThreadPoolExecutor(
+                    max_workers=MASK_DECODE_WORKERS,
+                    thread_name_prefix="mask-decode",
+                )
+            if self._write_pool is None:
+                self._write_pool = ThreadPoolExecutor(
+                    max_workers=MASK_WRITE_WORKERS,
+                    thread_name_prefix="mask-write",
+                )
+        return self._decode_pool, self._write_pool
+
+    def close(self) -> None:
+        """ワーカーを確実に止める。完了報告前と終了時に必ず呼ぶ。"""
+        with self._pool_lock:
+            for attribute in ("_decode_pool", "_write_pool"):
+                pool = getattr(self, attribute)
+                if pool is None:
+                    continue
+                pool.shutdown(wait=True)
+                setattr(self, attribute, None)
 
     def resolve_selected_label_ids(self, selected_categories: list[str]) -> set[int]:
         selected_label_ids: set[int] = set()
@@ -1084,183 +1203,201 @@ class SegFormerMaskGenerator:
         if not selected_label_ids:
             raise RuntimeError("選択されたマスク対象に対応する SegFormer ラベルが見つかりませんでした。")
 
-        if prioritize_detail:
+        if batch_size < MASK_BATCH_SIZE_LIMIT and prioritize_detail:
+            tile_estimate = len(
+                build_overlapping_tile_regions(
+                    2133, 2133, int(detail_preset["tile_size"]), int(detail_preset["overlap"])
+                )
+            )
+            if batch_size < tile_estimate:
+                self._log(
+                    f"注記: バッチ数 {batch_size} は 1 画像のタイル数 (約 {tile_estimate}) より"
+                    f"小さいため推論が分割されます。{MASK_BATCH_SIZE_LIMIT} まで上げられます。"
+                )
+
+        decode_pool, write_pool = self._pools()
+        write_futures: list[object] = []
+        try:
             for image_index, image_job in enumerate(image_jobs, start=1):
                 if stop_requested.is_set():
-                    return
+                    break
 
-                self._generate_mask_high_detail(
-                    image_job=image_job,
+                # 次の画像のデコードを GPU 計算と重ねて先読みする。
+                prefetch = [
+                    decode_pool.submit(load_image_bgr, job.image_path)
+                    for job in image_jobs[image_index : image_index + MASK_DECODE_WORKERS - 1]
+                ]
+                if image_index == 1:
+                    current = load_image_bgr(image_job.image_path)
+                else:
+                    current = pending_image.result()
+                pending_image = prefetch[0] if prefetch else None
+
+                mask_array, has_exclusion = self._generate_mask_for_image(
+                    bgr_image=current,
+                    prioritize_detail=prioritize_detail,
                     batch_size=batch_size,
-                    stop_requested=stop_requested,
                     tile_size=int(detail_preset["tile_size"]),
                     overlap=int(detail_preset["overlap"]),
                     confidence_threshold=confidence_threshold,
                     selected_label_ids=selected_label_ids,
                 )
+
+                if not has_exclusion:
+                    # 空マスクの削除は呼び出しスレッドで同期的に行う。
+                    # ワーカーに投げると前のランのマスクが生き残る窓ができる。
+                    image_job.mask_path.unlink(missing_ok=True)
+                else:
+                    write_futures.append(
+                        write_pool.submit(self._write_mask_png, mask_array, image_job.mask_path)
+                    )
+
                 if progress_callback is not None:
                     progress_callback(image_index, total)
-            return
+        finally:
+            # 完了を報告する前に全ての書き込みを終わらせ、例外を必ず浮上させる。
+            # Future を回収しないと ThreadPoolExecutor が例外を飲み込む。
+            first_error: BaseException | None = None
+            for future in write_futures:
+                try:
+                    future.result()
+                except BaseException as error:  # noqa: BLE001
+                    if first_error is None:
+                        first_error = error
+            if first_error is not None:
+                raise first_error
 
-        for batch_start in range(0, total, batch_size):
-            if stop_requested.is_set():
-                return
-
-            batch_jobs = image_jobs[batch_start : batch_start + batch_size]
-            batch_images: list[object] = []
-            batch_sizes: list[tuple[int, int]] = []
-            for image_job in batch_jobs:
-                with self.Image.open(image_job.image_path) as image:
-                    rgb_image = image.convert("RGB")
-                    batch_sizes.append(rgb_image.size)
-                    batch_images.append(rgb_image)
-
-            resized_masks = self._predict_resized_masks(
-                batch_images,
-                batch_sizes,
-                confidence_threshold,
-                selected_label_ids,
-            )
-            for image_job, resized_mask in zip(batch_jobs, resized_masks):
-                self._save_mask_array(resized_mask, image_job.mask_path)
-
-            if progress_callback is not None:
-                progress_callback(min(batch_start + len(batch_jobs), total), total)
-
-    def _predict_resized_masks(
+    def _generate_mask_for_image(
         self,
-        batch_images: list[object],
-        batch_sizes: list[tuple[int, int]],
-        confidence_threshold: float,
-        selected_label_ids: set[int],
-    ) -> list[object]:
-        inputs = self.image_processor(images=batch_images, return_tensors="pt")
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
-
-        with self.torch.inference_mode():
-            outputs = self.model(**inputs)
-
-        excluded_indices = sorted(selected_label_ids)
-        probabilities = self.torch.nn.functional.softmax(outputs.logits, dim=1)
-        excluded_probability_maps = probabilities[:, excluded_indices, :, :].sum(dim=1, keepdim=True)
-
-        unique_sizes = set(batch_sizes)
-        if len(unique_sizes) == 1:
-            target_width, target_height = batch_sizes[0]
-            resized_probability_maps = self.torch.nn.functional.interpolate(
-                excluded_probability_maps,
-                size=(target_height, target_width),
-                mode="bilinear",
-                align_corners=False,
-            )
-            return list(self._binarize_on_device(resized_probability_maps, confidence_threshold))
-
-        binary_masks: list[object] = []
-        for batch_index, target_size in enumerate(batch_sizes):
-            target_width, target_height = target_size
-            resized_probability_map = self.torch.nn.functional.interpolate(
-                excluded_probability_maps[batch_index : batch_index + 1],
-                size=(target_height, target_width),
-                mode="bilinear",
-                align_corners=False,
-            )
-            binary_masks.append(self._binarize_on_device(resized_probability_map, confidence_threshold)[0])
-        return binary_masks
-
-    def _binarize_on_device(self, probability_maps: object, confidence_threshold: float) -> object:
-        """確率マップを GPU 上で 2値化し、uint8 のまま CPU へ転送する。
-
-        従来は全解像度の float32 を CPU に落としてから `np.where` で閾値処理していた。
-        2133x2133 の 9 タイルでは転送が 4 倍(37.7MB)になり、単スレッドの numpy 比較が
-        38.2 ms/画像を占めていた。GPU 側で 2値化すれば転送は uint8 の 1/4 で済む。
-
-        閾値は float32 テンソルとして比較する。numpy 2.x (NEP 50) では
-        `float32配列 >= Python float` が float32 比較になるため、
-        `build_binary_usage_mask` と完全にビット一致する。
-        """
-        threshold = self.torch.tensor(
-            float(confidence_threshold),
-            dtype=self.torch.float32,
-            device=probability_maps.device,
-        )
-        binary = self.torch.where(
-            probability_maps[:, 0] >= threshold,
-            self.torch.zeros((), dtype=self.torch.uint8, device=probability_maps.device),
-            self.torch.full((), 255, dtype=self.torch.uint8, device=probability_maps.device),
-        )
-        return binary.cpu().numpy()
-
-    def _generate_mask_high_detail(
-        self,
-        image_job: ExtractedImageJob,
+        bgr_image: object,
+        prioritize_detail: bool,
         batch_size: int,
-        stop_requested: threading.Event,
         tile_size: int,
         overlap: int,
         confidence_threshold: float,
         selected_label_ids: set[int],
-    ) -> None:
-        with self.Image.open(image_job.image_path) as image:
-            rgb_image = image.convert("RGB")
-            image_width, image_height = rgb_image.size
+    ) -> tuple[object, bool]:
+        """1 画像分のマスクを作る。戻り値は (uint8 マスク, 除外領域があるか)。"""
+        torch = self.torch
+        image_height, image_width = bgr_image.shape[:2]
 
-            tile_regions = build_overlapping_tile_regions(
-                image_width,
-                image_height,
-                tile_size,
-                overlap,
+        if prioritize_detail:
+            regions = build_overlapping_tile_regions(image_width, image_height, tile_size, overlap)
+        else:
+            regions = [(0, 0, image_width, image_height)]
+
+        device_image = self._upload_image(bgr_image)
+        full_mask = torch.zeros((image_height, image_width), dtype=torch.uint8, device=self.device)
+        overlap_margin = overlap // 2
+
+        for batch_start in range(0, len(regions), batch_size):
+            region_batch = regions[batch_start : batch_start + batch_size]
+            tiles = self._preprocess_regions(device_image, region_batch)
+            probability = self._predict_excluded_probability(tiles, selected_label_ids)
+
+            # タイルは末端も build_tile_starts のクランプで同一サイズになるので
+            # 1 回の interpolate で済む (旧実装の per-item 分岐は発火しない)。
+            tile_width = region_batch[0][2] - region_batch[0][0]
+            tile_height = region_batch[0][3] - region_batch[0][1]
+            resized = torch.nn.functional.interpolate(
+                probability,
+                size=(tile_height, tile_width),
+                mode="bilinear",
+                align_corners=False,
             )
-            full_prediction = self.np.zeros((image_height, image_width), dtype=self.np.uint8)
-            overlap_margin = overlap // 2
+            binary = self._binarize_tensor(resized, confidence_threshold)
 
-            for batch_start in range(0, len(tile_regions), batch_size):
-                if stop_requested.is_set():
-                    return
-
-                region_batch = tile_regions[batch_start : batch_start + batch_size]
-                batch_images: list[object] = []
-                batch_sizes: list[tuple[int, int]] = []
-
-                for left, top, right, bottom in region_batch:
-                    tile_image = rgb_image.crop((left, top, right, bottom))
-                    batch_images.append(tile_image)
-                    batch_sizes.append(tile_image.size)
-
-                resized_masks = self._predict_resized_masks(
-                    batch_images,
-                    batch_sizes,
-                    confidence_threshold,
-                    selected_label_ids,
+            for tile_index, (left, top, right, bottom) in enumerate(region_batch):
+                horizontal_margin = min(overlap_margin, tile_width // 2)
+                vertical_margin = min(overlap_margin, tile_height // 2)
+                inner_left = 0 if left == 0 else horizontal_margin
+                inner_top = 0 if top == 0 else vertical_margin
+                inner_right = tile_width if right == image_width else max(inner_left + 1, tile_width - horizontal_margin)
+                inner_bottom = (
+                    tile_height if bottom == image_height else max(inner_top + 1, tile_height - vertical_margin)
                 )
-                for (left, top, right, bottom), mask_array in zip(region_batch, resized_masks):
-                    tile_width = right - left
-                    tile_height = bottom - top
-                    horizontal_margin = min(overlap_margin, tile_width // 2)
-                    vertical_margin = min(overlap_margin, tile_height // 2)
+                full_mask[
+                    top + inner_top : top + inner_bottom,
+                    left + inner_left : left + inner_right,
+                ] = binary[tile_index, inner_top:inner_bottom, inner_left:inner_right]
 
-                    inner_left = 0 if left == 0 else horizontal_margin
-                    inner_top = 0 if top == 0 else vertical_margin
-                    inner_right = tile_width if right == image_width else max(inner_left + 1, tile_width - horizontal_margin)
-                    inner_bottom = tile_height if bottom == image_height else max(inner_top + 1, tile_height - vertical_margin)
+        # 除外の有無も GPU 側で判定し、CPU の全画素走査を省く。
+        has_exclusion = bool((full_mask == 0).any().item())
+        return full_mask.cpu().numpy(), has_exclusion
 
-                    full_prediction[
-                        top + inner_top : top + inner_bottom,
-                        left + inner_left : left + inner_right,
-                    ] = mask_array[inner_top:inner_bottom, inner_left:inner_right]
+    def _upload_image(self, bgr_image: object) -> object:
+        """BGR uint8 を 1 回だけ GPU へ送り、RGB float32 の NCHW にする。
 
-            self._save_mask_array(full_prediction, image_job.mask_path)
+        旧実装は PIL で 9 回 crop し、SegformerImageProcessor が numpy で
+        resize + normalize していた (実測 114.5 ms/画像)。ここを GPU に移すと
+        24.3 ms になる。転送は uint8 のまま行うので 3 倍軽い。
+        """
+        torch = self.torch
+        tensor = torch.from_numpy(self.np.ascontiguousarray(bgr_image)).to(self.device)
+        # HWC BGR -> CHW RGB
+        tensor = tensor.permute(2, 0, 1).flip(0)
+        return tensor.unsqueeze(0).float().mul_(self.rescale_factor)
 
-    def _save_mask_array(self, binary_mask: object, mask_path: Path) -> None:
-        mask_array = self.np.asarray(binary_mask, dtype=self.np.uint8)
-        if not mask_contains_excluded_region(mask_array):
-            mask_path.unlink(missing_ok=True)
-            return
-        # compress_level は既定 6。実測 (2133x2133 / 除外率 37.6%):
-        #   level 6 = 21.95 ms / 11395 B   level 2 = 15.84 ms / 11464 B (+0.6%)
-        #   level 1 = 16.69 ms / 50952 B (4.5倍に膨張)   level 0 = 4.5 MB
-        # 2 が速度とサイズの折れ点。下げすぎないこと。
-        # mode= は Pillow 13 で削除予定。2次元 uint8 配列なら "L" が自動推論される。
-        self.Image.fromarray(mask_array).save(
+    def _preprocess_regions(self, device_image: object, regions: list[tuple[int, int, int, int]]) -> object:
+        torch = self.torch
+        tiles = []
+        for left, top, right, bottom in regions:
+            tile = device_image[:, :, top:bottom, left:right]
+            tiles.append(
+                torch.nn.functional.interpolate(
+                    tile,
+                    size=(self.input_height, self.input_width),
+                    mode="bilinear",
+                    align_corners=False,
+                    # PIL の BILINEAR 縮小と一致させるために必須。
+                    # 無いと正規化後 max abs 0.51 ずれ、しきい値 0.7 を跨ぐ。
+                    antialias=True,
+                )
+            )
+        batch = torch.cat(tiles, dim=0)
+        return (batch - self.mean_tensor) / self.std_tensor
+
+    def _predict_excluded_probability(self, tiles: object, selected_label_ids: set[int]) -> object:
+        """選択ラベルの合計確率マップ (N,1,h,w) を返す。"""
+        torch = self.torch
+        excluded_indices = sorted(selected_label_ids)
+
+        logits = self._forward_logits(tiles, use_fp16=self.use_fp16)
+        if self.use_fp16 and not bool(torch.isfinite(logits).all().item()):
+            # fp16 の非有限は「マスクなし」に化ける: NaN >= 0.7 は False なので
+            # 全面 255 になり、_write_mask_png も呼ばれずファイルが消える。
+            # 数値失敗と「除外対象が無かった」を区別できるようにここで拾う。
+            self.non_finite_batches += 1
+            self._log("警告: fp16 推論で非有限値が出たため、このバッチを fp32 で再計算します。")
+            logits = self._forward_logits(tiles, use_fp16=False)
+
+        probabilities = logits.softmax(dim=1)
+        return probabilities[:, excluded_indices, :, :].sum(dim=1, keepdim=True)
+
+    def _forward_logits(self, tiles: object, use_fp16: bool) -> object:
+        model = self.model_fp16 if (use_fp16 and self.model_fp16 is not None) else self.model
+        pixel_values = tiles.half() if (use_fp16 and self.model_fp16 is not None) else tiles
+        with self.torch.inference_mode():
+            logits = model(pixel_values=pixel_values).logits
+        return logits.float()
+
+    def _binarize_tensor(self, probability_maps: object, confidence_threshold: float) -> object:
+        """GPU 上で 2値化する。0 = 除外, 255 = 使用。"""
+        torch = self.torch
+        threshold = torch.tensor(
+            float(confidence_threshold),
+            dtype=torch.float32,
+            device=probability_maps.device,
+        )
+        return torch.where(
+            probability_maps[:, 0] >= threshold,
+            torch.zeros((), dtype=torch.uint8, device=probability_maps.device),
+            torch.full((), 255, dtype=torch.uint8, device=probability_maps.device),
+        )
+
+    def _write_mask_png(self, mask_array: object, mask_path: Path) -> None:
+        array = self.np.asarray(mask_array, dtype=self.np.uint8)
+        self.Image.fromarray(array).save(
             mask_path,
             compress_level=MASK_PNG_COMPRESS_LEVEL,
             optimize=False,
@@ -1287,13 +1424,14 @@ class Insta360ExtractorApp:
         self.width_var = tk.StringVar(value=str(DEFAULT_WIDTH))
         self.height_var = tk.StringVar(value=str(DEFAULT_HEIGHT))
         self.parallelism_var = tk.StringVar(value=str(DEFAULT_PARALLELISM))
-        self.mask_parallelism_var = tk.StringVar(value=str(DEFAULT_PARALLELISM))
+        self.mask_parallelism_var = tk.StringVar(value=str(DEFAULT_MASK_BATCH_SIZE))
         self.run_extract_var = tk.BooleanVar(value=True)
         self.use_gpu_var = tk.BooleanVar(value=self.cuda_available)
         self.reverse_var = tk.BooleanVar(value=False)
         self.reverse_direction_index_on_odd_var = tk.BooleanVar(value=False)
         self.generate_masks_var = tk.BooleanVar(value=False)
         self.mask_detail_level_var = tk.StringVar(value=DEFAULT_MASK_DETAIL_LEVEL)
+        self.mask_precision_var = tk.StringVar(value=DEFAULT_MASK_PRECISION)
         self.mask_confidence_threshold_var = tk.StringVar(value=direction_aware_float(DEFAULT_MASK_CONFIDENCE_THRESHOLD))
         self.mask_sky_var = tk.BooleanVar(value=True)
         self.mask_person_var = tk.BooleanVar(value=True)
@@ -1316,7 +1454,8 @@ class Insta360ExtractorApp:
         self.stop_requested = threading.Event()
         self.process_lock = threading.Lock()
         self.current_processes: dict[int, subprocess.Popen[str]] = {}
-        self.segformer_mask_generator: SegFormerMaskGenerator | None = None
+        self.segformer_mask_generators: list[SegFormerMaskGenerator] = []
+        self.segformer_cache_key: tuple[str, tuple[str, ...]] | None = None
 
         self.preview_photo: tk.PhotoImage | None = None
         self.preview_path: Path | None = None
@@ -1527,6 +1666,14 @@ class Insta360ExtractorApp:
         ).pack(side="left")
         ttk.Label(mask_group, text="除外しきい値").pack(side="left", padx=(16, 6))
         ttk.Entry(mask_group, width=8, textvariable=self.mask_confidence_threshold_var).pack(side="left")
+        ttk.Label(mask_group, text="精度").pack(side="left", padx=(16, 6))
+        ttk.Combobox(
+            mask_group,
+            textvariable=self.mask_precision_var,
+            values=list(MASK_PRECISION_CHOICES),
+            width=6,
+            state="readonly",
+        ).pack(side="left")
 
         ttk.Label(
             settings_frame,
@@ -1812,6 +1959,7 @@ class Insta360ExtractorApp:
             "reverse_direction_index_on_odd": bool(self.reverse_direction_index_on_odd_var.get()),
             "generate_masks": bool(self.generate_masks_var.get()),
             "mask_detail_level": self.mask_detail_level_var.get().strip(),
+            "mask_precision": self.mask_precision_var.get().strip(),
             "mask_confidence_threshold": self.mask_confidence_threshold_var.get().strip(),
             "mask_sky": bool(self.mask_sky_var.get()),
             "mask_person": bool(self.mask_person_var.get()),
@@ -1914,6 +2062,10 @@ class Insta360ExtractorApp:
             saved_mask_detail = payload.get("mask_detail")
             if isinstance(saved_mask_detail, bool):
                 self.mask_detail_level_var.set("高" if saved_mask_detail else DEFAULT_MASK_DETAIL_LEVEL)
+
+        saved_mask_precision = payload.get("mask_precision")
+        if isinstance(saved_mask_precision, str) and saved_mask_precision in MASK_PRECISION_CHOICES:
+            self.mask_precision_var.set(saved_mask_precision)
 
         saved_mask_confidence_threshold = payload.get("mask_confidence_threshold")
         if isinstance(saved_mask_confidence_threshold, str):
@@ -2033,10 +2185,49 @@ class Insta360ExtractorApp:
         if self.input_path_var.get().strip():
             self._load_preview_for_current_input(show_errors=False)
 
-    def _get_segformer_mask_generator(self) -> SegFormerMaskGenerator:
-        if self.segformer_mask_generator is None:
-            self.segformer_mask_generator = SegFormerMaskGenerator()
-        return self.segformer_mask_generator
+    def _mask_devices(self) -> list[str | None]:
+        """マスク推論に使うデバイス。CUDA が複数あれば全部使う。"""
+        try:
+            import torch
+        except ImportError:
+            return [None]
+        if not torch.cuda.is_available():
+            return [None]
+        count = torch.cuda.device_count()
+        if count <= 1:
+            return ["cuda:0"]
+        return [f"cuda:{index}" for index in range(count)]
+
+    def _get_segformer_mask_generators(self, precision: str) -> list[SegFormerMaskGenerator]:
+        """デバイスごとに生成器をキャッシュして返す。
+
+        1 インスタンスだけをキャッシュしていた頃は 2 枚目の GPU が遊んでいた。
+        重みは segformer-b0 で 14.3 MiB なので複数持っても実質ゼロコスト。
+        """
+        def emit(message: str) -> None:
+            self.log_queue.put(("log", message))
+
+        wanted = self._mask_devices()
+        cache_key = (precision, tuple(str(device) for device in wanted))
+        if self.segformer_cache_key != cache_key:
+            self._release_mask_generators()
+            self.segformer_cache_key = cache_key
+
+        if not self.segformer_mask_generators:
+            for device in wanted:
+                self.segformer_mask_generators.append(
+                    SegFormerMaskGenerator(device=device, precision=precision, log_callback=emit)
+                )
+        return self.segformer_mask_generators
+
+    def _release_mask_generators(self) -> None:
+        for generator in self.segformer_mask_generators:
+            try:
+                generator.close()
+            except Exception:
+                pass
+        self.segformer_mask_generators = []
+        self.segformer_cache_key = None
 
     def _selected_mask_categories(self) -> list[str]:
         selected_categories: list[str] = []
@@ -3626,6 +3817,9 @@ class Insta360ExtractorApp:
         mask_detail_level = self.mask_detail_level_var.get().strip()
         if mask_detail_level not in MASK_DETAIL_PRESETS:
             raise ValueError("マスクの細かさは標準・高・最高から選択してください。")
+        mask_precision = self.mask_precision_var.get().strip()
+        if mask_precision not in MASK_PRECISION_CHOICES:
+            raise ValueError("マスク精度は fp16 か fp32 から選択してください。")
         mask_categories = self._selected_mask_categories()
 
         ffmpeg_path = self.ffmpeg_path or shutil.which("ffmpeg")
@@ -3659,6 +3853,7 @@ class Insta360ExtractorApp:
             "reverse_direction_index_on_odd": reverse_direction_index_on_odd,
             "generate_masks": bool(self.generate_masks_var.get()),
             "mask_detail_level": mask_detail_level,
+            "mask_precision": mask_precision,
             "mask_confidence_threshold": mask_confidence_threshold,
             "mask_categories": mask_categories,
         }
@@ -3682,6 +3877,7 @@ class Insta360ExtractorApp:
         reverse_direction_index_on_odd = options["reverse_direction_index_on_odd"]
         generate_masks = options["generate_masks"]
         mask_detail_level = options["mask_detail_level"]
+        mask_precision = options["mask_precision"]
         mask_confidence_threshold = options["mask_confidence_threshold"]
         mask_categories = options["mask_categories"]
 
@@ -3703,6 +3899,7 @@ class Insta360ExtractorApp:
         assert isinstance(reverse_direction_index_on_odd, bool)
         assert isinstance(generate_masks, bool)
         assert isinstance(mask_detail_level, str)
+        assert isinstance(mask_precision, str)
         assert isinstance(mask_confidence_threshold, float)
         assert isinstance(mask_categories, list)
 
@@ -3793,6 +3990,7 @@ class Insta360ExtractorApp:
                     video_stem,
                     mask_parallelism,
                     mask_detail_level,
+                    mask_precision,
                     mask_confidence_threshold,
                     mask_categories,
                 )
@@ -3812,6 +4010,7 @@ class Insta360ExtractorApp:
         video_stem: str | None,
         parallelism: int,
         detail_level: str,
+        precision: str,
         confidence_threshold: float,
         selected_categories: list[str],
     ) -> None:
@@ -3820,29 +4019,80 @@ class Insta360ExtractorApp:
             self.log_queue.put(("log", "SegFormerマスク生成: 対象画像が見つかりませんでした。"))
             return
 
-        generator = self._get_segformer_mask_generator()
+        generators = self._get_segformer_mask_generators(precision)
+        total = len(image_jobs)
         self.log_queue.put(
             (
                 "log",
-                f"SegFormerマスク生成を開始: {len(image_jobs)} 枚 | model={generator.model_id} | "
-                f"device={generator.device_label()} | 細かさ={detail_level} | "
+                f"SegFormerマスク生成を開始: {total} 枚 | model={generators[0].model_id} | "
+                f"device={','.join(g.device_label() for g in generators)} | "
+                f"精度={generators[0].precision_label()} | バッチ数={parallelism} | 細かさ={detail_level} | "
                 f"除外しきい値={direction_aware_float(confidence_threshold)} | "
                 f"対象={','.join(MASK_CATEGORY_DISPLAY_NAMES.get(category, category) for category in selected_categories)}",
             )
         )
 
-        def progress_callback(done_count: int, total_count: int) -> None:
-            self.log_queue.put(("log", f"SegFormerマスク生成: {done_count}/{total_count}"))
+        completed = 0
+        progress_lock = threading.Lock()
+        last_reported = 0.0
+        errors: list[BaseException] = []
 
-        generator.generate_masks(
-            image_jobs=image_jobs,
-            batch_size=parallelism,
-            stop_requested=self.stop_requested,
-            detail_level=detail_level,
-            confidence_threshold=confidence_threshold,
-            selected_categories=selected_categories,
-            progress_callback=progress_callback,
-        )
+        def report(_done: int, _total: int) -> None:
+            nonlocal completed, last_reported
+            with progress_lock:
+                completed += 1
+                now = time.monotonic()
+                # 複数ワーカーから来るので、件数はロック下の通し番号で数える。
+                if completed == total or now - last_reported >= MASK_PROGRESS_MIN_INTERVAL_SECONDS:
+                    last_reported = now
+                    self.log_queue.put(("log", f"SegFormerマスク生成: {completed}/{total}"))
+
+        # 画像を交互に割り振る。速度差のあるカード同士でも、遅い側が
+        # 少しずつ受け持つだけで済む (RTX 3060 + RTX 2060)。
+        shards = [image_jobs[index :: len(generators)] for index in range(len(generators))]
+
+        def worker(generator: SegFormerMaskGenerator, jobs: list[ExtractedImageJob]) -> None:
+            try:
+                generator.generate_masks(
+                    image_jobs=jobs,
+                    batch_size=parallelism,
+                    stop_requested=self.stop_requested,
+                    detail_level=detail_level,
+                    confidence_threshold=confidence_threshold,
+                    selected_categories=selected_categories,
+                    progress_callback=report,
+                )
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+                self.stop_requested.set()
+
+        threads = [
+            threading.Thread(target=worker, args=(generator, jobs), daemon=True)
+            for generator, jobs in zip(generators, shards)
+            if jobs
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        # 書き込みワーカーを完了報告の前に必ず止める。動いたまま「完了」を出すと
+        # ファイルが書かれている最中にダイアログが出る。
+        for generator in generators:
+            generator.close()
+
+        if errors:
+            raise errors[0]
+
+        non_finite = sum(generator.non_finite_batches for generator in generators)
+        if non_finite:
+            self.log_queue.put(
+                (
+                    "log",
+                    f"警告: fp16 推論で非有限値が {non_finite} バッチ発生し fp32 で再計算しました。"
+                    "精度を fp32 にすると回避できます。",
+                )
+            )
 
         if not self.stop_requested.is_set():
             self.log_queue.put(("log", "SegFormerマスク生成が完了しました。"))
@@ -3968,7 +4218,7 @@ class Insta360ExtractorApp:
     def _warn_about_orphaned_masks(self, output_dir: Path, video_stem: str | None) -> None:
         """元画像が消えたマスクが残っていないか警告する。
 
-        _save_mask_array は新しいマスクが空の時にしか unlink しないので、
+        空マスクの unlink は新しいマスクが空の時にしか走らないので、
         前回より短いランを行うと過去のマスクが残り続ける。消すのは利用者の判断
         なので、ここでは件数を知らせるだけにする。
         """
@@ -4207,6 +4457,7 @@ class Insta360ExtractorApp:
         except Exception:
             pass
 
+        self._release_mask_generators()
         self._pause_preview_playback()
         self._close_preview_capture()
         self._release_preview_vlc()
@@ -4231,7 +4482,30 @@ class Insta360ExtractorApp:
             setattr(self, attribute, None)
 
 
+def preload_native_backends() -> None:
+    """Tk のウィンドウを作る前に torch のネイティブ DLL を読み込む。
+
+    Windows でこの順序を守らないと、マスク生成が**プロセスごと落ちる**。
+    Tk のインタプリタを先に作ってから transformers を使うと、
+    `from_pretrained` が実行時に torchvision の C 拡張を読み込む際に
+    DLL の解決が衝突し、アクセス違反で即死する (実測: 終了コード 139、
+    クラッシュ位置は torchvision/io/image.py の ctypes.CDLL)。
+
+    先に `import torch` しておくと解消する (実測 3.1 秒、以後は正常動作)。
+    torch は任意依存なので、入っていない環境では何もしない。
+
+    SegFormerMaskGenerator を GUI 以外から使う場合も、Tk を作る前に
+    これを呼ぶこと。
+    """
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        # torch が無い環境ではマスク生成自体を使えないので、ここは黙って抜ける。
+        return
+
+
 def main() -> None:
+    preload_native_backends()
     root = tk.Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():

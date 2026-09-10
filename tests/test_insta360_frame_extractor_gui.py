@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 
 from insta360_frame_extractor_gui import (
+    DEFAULT_MASK_BATCH_SIZE,
+    MASK_BATCH_SIZE_LIMIT,
     Direction,
     DirectionSet,
     build_direction_filter_graph,
@@ -28,10 +30,12 @@ from insta360_frame_extractor_gui import (
     fit_size_within_bounds,
     generate_ring_directions,
     is_ffmpeg_progress_line,
+    load_image_bgr,
     mask_contains_excluded_region,
     parse_angle,
     parse_ffmpeg_time_seconds,
     parse_probability_threshold,
+    preload_native_backends,
     resolve_mask_detail_preset,
     select_ffmpeg_error_detail,
 )
@@ -167,6 +171,61 @@ class Insta360FrameExtractorGuiTests(unittest.TestCase):
         detail = select_ffmpeg_error_detail(long_lines, "[1/1]", 1)
         self.assertLessEqual(len(detail), 500)
         self.assertTrue(detail.endswith("..."))
+
+    def test_load_image_bgr_handles_non_ascii_paths_and_rejects_truncation(self) -> None:
+        import numpy as np
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # cv2.imread はこのパスで None を返す。imdecode + np.fromfile なら読める。
+            japanese_dir = Path(temp_dir) / "ドキュメント_出力" / "テスト フォルダ"
+            japanese_dir.mkdir(parents=True)
+            image_path = japanese_dir / "動画_0000_00.jpg"
+            Image.fromarray(np.full((64, 48, 3), 120, dtype=np.uint8)).save(image_path, quality=95)
+
+            loaded = load_image_bgr(image_path)
+            self.assertEqual(np.asarray(loaded).shape, (64, 48, 3))
+
+            raw = image_path.read_bytes()
+            for fraction in (0.05, 0.5, 0.9, 0.999):
+                truncated = japanese_dir / f"trunc_{fraction}.jpg"
+                truncated.write_bytes(raw[: max(4, int(len(raw) * fraction))])
+                with self.subTest(fraction=fraction):
+                    # 途中まで書かれた JPEG を黙って読むとマスクが静かに壊れる。
+                    with self.assertRaises(RuntimeError):
+                        load_image_bgr(truncated)
+
+            empty = japanese_dir / "empty.jpg"
+            empty.write_bytes(b"")
+            with self.assertRaises(RuntimeError):
+                load_image_bgr(empty)
+
+    def test_preload_native_backends_is_safe_to_call(self) -> None:
+        # Tk を作る前に torch の DLL を読ませるためのフック。
+        # 呼んでも例外を出さず、何度呼んでも良いこと。
+        preload_native_backends()
+        preload_native_backends()
+
+    def test_main_preloads_before_creating_the_tk_root(self) -> None:
+        # 順序が逆になると Windows でマスク生成がプロセスごと落ちる。
+        import inspect
+        import insta360_frame_extractor_gui as module
+
+        source = inspect.getsource(module.main)
+        self.assertLess(
+            source.index("preload_native_backends()"),
+            source.index("tk.Tk()"),
+            "preload_native_backends() must run before tk.Tk()",
+        )
+
+    def test_mask_batch_limit_allows_one_pass_per_image(self) -> None:
+        # 最高 は 2133x2133 で 9 タイルなので、上限が 9 未満だと必ず分割される。
+        tiles = len(build_overlapping_tile_regions(2133, 2133, 1024, 256))
+        self.assertEqual(tiles, 9)
+        self.assertGreaterEqual(MASK_BATCH_SIZE_LIMIT, tiles)
+        self.assertEqual(DEFAULT_MASK_BATCH_SIZE, tiles)
+        # VRAM 実測 (B=32 で 4851 MiB) から 18 を超えないこと。
+        self.assertLessEqual(MASK_BATCH_SIZE_LIMIT, 18)
 
     def test_parse_probability_threshold_rejects_zero_and_out_of_range(self) -> None:
         # 0 を許すと「確率 >= 0」が常に真になり全面黒マスクになる。

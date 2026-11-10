@@ -422,6 +422,80 @@ def compute_vertical_fov(horizontal_fov: float, width: int, height: int) -> floa
     return math.degrees(2.0 * math.atan(math.tan(math.radians(horizontal_fov) / 2.0) * aspect_ratio))
 
 
+def compute_focal_length_35mm(horizontal_fov: float, width: int, height: int) -> float:
+    """v360 の flat 出力に対応する 35mm 換算焦点距離を返す。
+
+    v360 の flat 出力は理想ピンホール投影そのもので、レンズ歪みが無く、主点は画像中心、
+    画素は正方 (`compute_vertical_fov` が水平画角とアスペクト比から v_fov を導くため
+    fx == fy になる)。したがって焦点距離は推定するまでもなく水平画角から厳密に決まる。
+
+    RealityScan / RealityCapture は 35mm 換算焦点距離を画像の長辺基準で扱うため、
+    f_px = (width / 2) / tan(h_fov / 2) を長辺で正規化して 36mm を掛ける。
+    """
+    half_angle = math.tan(math.radians(horizontal_fov) / 2.0)
+    if half_angle <= 0.0:
+        raise ValueError("画角は 0 度より大きく 180 度未満で指定してください。")
+    focal_length_pixels = (width / 2.0) / half_angle
+    return 36.0 * focal_length_pixels / max(width, height)
+
+
+def build_xmp_sidecar_path(image_path: Path) -> Path:
+    """RealityScan は `<画像名>.xmp` を同じフォルダから読み込む。"""
+    return image_path.with_suffix(".xmp")
+
+
+def build_xmp_document(
+    focal_length_35mm: float,
+    calibration_group: int = 0,
+    distortion_group: int = 0,
+    in_texturing: bool = True,
+    in_meshing: bool = True,
+) -> str:
+    """RealityScan / RealityCapture 用の XMP サイドカーを組み立てる。
+
+    姿勢 (Rotation / Position) は書かない。回転行列の座標系規約を実機で確認できていないため、
+    誤った姿勢事前情報はアライメントを助けるどころか破壊しうる。
+    一方でキャリブレーションは v360 の出力仕様から厳密に確定するので、そこだけを渡す。
+
+    `CalibrationGroup` / `DistortionGroup` を全画像で共有させることで、
+    「これらは全て同一の合成カメラで撮られた」と RealityScan に伝えられる。
+    これによりキャリブレーションの推定が 1 グループに集約され、収束が速く安定する。
+    """
+    return (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">\n'
+        '  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+        '    <rdf:Description xmlns:xcr="http://www.capturingreality.com/ns/xcr/1.1#"\n'
+        '      xcr:Version="2"\n'
+        '      xcr:DistortionModel="division"\n'
+        f'      xcr:FocalLength35mm="{focal_length_35mm:.9f}"\n'
+        '      xcr:CalibrationPrior="initial"\n'
+        f'      xcr:CalibrationGroup="{calibration_group}"\n'
+        f'      xcr:DistortionGroup="{distortion_group}"\n'
+        f'      xcr:InTexturing="{1 if in_texturing else 0}"\n'
+        f'      xcr:InMeshing="{1 if in_meshing else 0}"/>\n'
+        '  </rdf:RDF>\n'
+        '</x:xmpmeta>\n'
+    )
+
+
+def write_xmp_sidecar(
+    image_path: Path,
+    focal_length_35mm: float,
+    calibration_group: int = 0,
+    distortion_group: int = 0,
+) -> Path:
+    sidecar_path = build_xmp_sidecar_path(image_path)
+    sidecar_path.write_text(
+        build_xmp_document(
+            focal_length_35mm,
+            calibration_group=calibration_group,
+            distortion_group=distortion_group,
+        ),
+        encoding="utf-8",
+    )
+    return sidecar_path
+
+
 def build_v360_filter(
     direction: Direction,
     fov: float,
@@ -1488,6 +1562,7 @@ class Insta360ExtractorApp:
         self.reverse_direction_index_on_odd_var = tk.BooleanVar(value=False)
         self.generate_masks_var = tk.BooleanVar(value=False)
         self.use_frame_cache_var = tk.BooleanVar(value=False)
+        self.write_xmp_var = tk.BooleanVar(value=False)
         self.mask_detail_level_var = tk.StringVar(value=DEFAULT_MASK_DETAIL_LEVEL)
         self.mask_precision_var = tk.StringVar(value=DEFAULT_MASK_PRECISION)
         self.mask_confidence_threshold_var = tk.StringVar(value=direction_aware_float(DEFAULT_MASK_CONFIDENCE_THRESHOLD))
@@ -1698,6 +1773,11 @@ class Insta360ExtractorApp:
             run_group,
             text="フレームキャッシュ",
             variable=self.use_frame_cache_var,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            run_group,
+            text="RealityScan用XMP",
+            variable=self.write_xmp_var,
         ).pack(side="left", padx=(12, 0))
 
         settings_label("マスク対象", 2, 2)
@@ -2023,6 +2103,7 @@ class Insta360ExtractorApp:
             "reverse_direction_index_on_odd": bool(self.reverse_direction_index_on_odd_var.get()),
             "generate_masks": bool(self.generate_masks_var.get()),
             "use_frame_cache": bool(self.use_frame_cache_var.get()),
+            "write_xmp": bool(self.write_xmp_var.get()),
             "mask_detail_level": self.mask_detail_level_var.get().strip(),
             "mask_precision": self.mask_precision_var.get().strip(),
             "mask_confidence_threshold": self.mask_confidence_threshold_var.get().strip(),
@@ -2138,6 +2219,7 @@ class Insta360ExtractorApp:
 
         for key, variable in (
             ("use_frame_cache", self.use_frame_cache_var),
+            ("write_xmp", self.write_xmp_var),
             ("mask_sky", self.mask_sky_var),
             ("mask_person", self.mask_person_var),
             ("mask_car", self.mask_car_var),
@@ -3951,6 +4033,7 @@ class Insta360ExtractorApp:
             "reverse_direction_index_on_odd": reverse_direction_index_on_odd,
             "generate_masks": bool(self.generate_masks_var.get()),
             "use_frame_cache": bool(self.use_frame_cache_var.get()),
+            "write_xmp": bool(self.write_xmp_var.get()),
             "mask_detail_level": mask_detail_level,
             "mask_precision": mask_precision,
             "mask_confidence_threshold": mask_confidence_threshold,
@@ -3976,6 +4059,7 @@ class Insta360ExtractorApp:
         reverse_direction_index_on_odd = options["reverse_direction_index_on_odd"]
         generate_masks = options["generate_masks"]
         use_frame_cache = options["use_frame_cache"]
+        write_xmp = options["write_xmp"]
         mask_detail_level = options["mask_detail_level"]
         mask_precision = options["mask_precision"]
         mask_confidence_threshold = options["mask_confidence_threshold"]
@@ -3999,6 +4083,7 @@ class Insta360ExtractorApp:
         assert isinstance(reverse_direction_index_on_odd, bool)
         assert isinstance(generate_masks, bool)
         assert isinstance(use_frame_cache, bool)
+        assert isinstance(write_xmp, bool)
         assert isinstance(mask_detail_level, str)
         assert isinstance(mask_precision, str)
         assert isinstance(mask_confidence_threshold, float)
@@ -4012,6 +4097,7 @@ class Insta360ExtractorApp:
             reverse_text = "ON" if reverse_video else "OFF"
             naming_text = "ON" if reverse_direction_index_on_odd else "OFF"
             mask_text = "ON" if run_masks else "OFF"
+            xmp_text = "ON" if write_xmp else "OFF"
             detail_text = mask_detail_level
             threshold_text = direction_aware_float(mask_confidence_threshold)
             categories_text = ",".join(MASK_CATEGORY_DISPLAY_NAMES.get(category, category) for category in mask_categories)
@@ -4026,7 +4112,7 @@ class Insta360ExtractorApp:
                     f"実行内容: {mode_text} | 抽出: 単一デコード{total}方向同時 | GPUデコード: {gpu_text} | "
                     f"逆再生: {reverse_text} | 奇数フレーム方向index逆順: {naming_text} | "
                     f"SegFormerマスク: {mask_text} | マスクバッチ数: {mask_parallelism} | 細かさ: {detail_text} | "
-                    f"除外しきい値: {threshold_text} | 対象: {categories_text}",
+                    f"除外しきい値: {threshold_text} | 対象: {categories_text} | RealityScan用XMP: {xmp_text}",
                 )
             )
 
@@ -4086,6 +4172,20 @@ class Insta360ExtractorApp:
                     # ここで止めないと、途中で切れた出力に対してマスクを作ってしまう。
                     self.log_queue.put(("error", mismatch))
                     return
+
+                if write_xmp:
+                    focal_length_35mm = compute_focal_length_35mm(fov, width, height)
+                    sidecar_count = self._write_xmp_sidecars(
+                        output_dir, video_stem, focal_length_35mm
+                    )
+                    self.log_queue.put(
+                        (
+                            "log",
+                            f"RealityScan用XMP: 35mm換算焦点距離 {focal_length_35mm:.4f}mm"
+                            f" (歪みなし / 全画像を同一キャリブレーショングループ) を "
+                            f"{sidecar_count} 枚へ書き出しました。",
+                        )
+                    )
 
                 self.log_queue.put(("log", f"抽出完了: {total} 方向"))
                 extracted_this_run = True
@@ -4426,6 +4526,23 @@ class Insta360ExtractorApp:
                 return "error", detail
 
         return "error", last_detail or "抽出に失敗しました。"
+
+    def _write_xmp_sidecars(
+        self,
+        output_dir: Path,
+        video_stem: str,
+        focal_length_35mm: float,
+    ) -> int:
+        """抽出済みの全画像に RealityScan 用 XMP を書く。
+
+        `.jpg` だけを対象にするので `*.jpg.mask.png` は拾わない。
+        v360 の flat 出力は全方向が同一の理想ピンホールカメラなので、
+        姿勢は書かずキャリブレーションだけを共有させる。
+        """
+        image_paths = sorted(output_dir.glob(f"{glob.escape(video_stem)}_*.jpg"))
+        for image_path in image_paths:
+            write_xmp_sidecar(image_path, focal_length_35mm)
+        return len(image_paths)
 
     def _warn_about_orphaned_masks(self, output_dir: Path, video_stem: str | None) -> None:
         """元画像が消えたマスクが残っていないか警告する。

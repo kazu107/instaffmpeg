@@ -19,10 +19,13 @@ from insta360_frame_extractor_gui import (
     build_output_pattern,
     build_shared_decode_head,
     build_tile_starts,
+    build_xmp_document,
+    build_xmp_sidecar_path,
     build_binary_usage_mask,
     collect_segformer_excluded_label_groups,
     collect_segformer_excluded_label_ids,
     compute_expected_frame_count,
+    compute_focal_length_35mm,
     compute_output_direction_index,
     compute_vertical_fov,
     compute_preview_box,
@@ -40,6 +43,7 @@ from insta360_frame_extractor_gui import (
     preload_mask_backends,
     resolve_mask_detail_preset,
     select_ffmpeg_error_detail,
+    write_xmp_sidecar,
 )
 
 
@@ -592,6 +596,51 @@ class Insta360FrameExtractorGuiTests(unittest.TestCase):
     def test_compute_vertical_fov_matches_output_aspect_ratio(self) -> None:
         self.assertAlmostEqual(compute_vertical_fov(100.0, 1600, 900), 67.672748, places=5)
 
+    def test_compute_focal_length_35mm_matches_a_pinhole_projection(self) -> None:
+        # 90 度なら f_px = (1920 / 2) / tan(45) = 960、長辺 1920 で正規化して 36mm 換算 18mm。
+        self.assertAlmostEqual(compute_focal_length_35mm(90.0, 1920, 1080), 18.0, places=9)
+
+    def test_compute_focal_length_35mm_normalizes_on_the_long_side(self) -> None:
+        # 縦長でも長辺基準で正規化する (RealityScan の 35mm 換算の定義)。
+        portrait = compute_focal_length_35mm(90.0, 1080, 1920)
+        self.assertAlmostEqual(portrait, 36.0 * (1080 / 2.0) / 1920.0, places=9)
+
+    def test_compute_focal_length_35mm_rejects_impossible_fov(self) -> None:
+        with self.assertRaises(ValueError):
+            compute_focal_length_35mm(0.0, 1920, 1080)
+        with self.assertRaises(ValueError):
+            compute_focal_length_35mm(200.0, 1920, 1080)
+
+    def test_xmp_sidecar_path_drops_the_image_extension(self) -> None:
+        # RealityScan は `Image01.jpg` に対して `Image01.xmp` を探す。
+        sidecar = build_xmp_sidecar_path(Path("C:/output/room360_0000_07.jpg"))
+        self.assertEqual(str(sidecar).replace("\\", "/"), "C:/output/room360_0000_07.xmp")
+
+    def test_xmp_document_carries_the_focal_length_and_groups(self) -> None:
+        document = build_xmp_document(18.0, calibration_group=3, distortion_group=4)
+        self.assertIn('xcr:FocalLength35mm="18.000000000"', document)
+        self.assertIn('xcr:CalibrationPrior="initial"', document)
+        self.assertIn('xcr:CalibrationGroup="3"', document)
+        self.assertIn('xcr:DistortionGroup="4"', document)
+        self.assertIn('xcr:DistortionModel="division"', document)
+        # 姿勢は座標系規約が未確認なので書かない。
+        self.assertNotIn("xcr:Rotation", document)
+        self.assertNotIn("xcr:Position", document)
+
+    def test_write_xmp_sidecar_writes_utf8_next_to_the_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "room360_0000_00.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff\xd9")
+
+            sidecar_path = write_xmp_sidecar(image_path, 18.0)
+
+            self.assertEqual(sidecar_path.suffix, ".xmp")
+            self.assertEqual(sidecar_path, image_path.with_suffix(".xmp"))
+            self.assertIn(
+                'xcr:FocalLength35mm="18.000000000"',
+                sidecar_path.read_text(encoding="utf-8"),
+            )
+
     def test_direction_to_equirect_point_maps_forward_to_center(self) -> None:
         point = direction_to_equirect_point(Direction(yaw=0.0, pitch=0.0), 4000, 2000)
         self.assertEqual(point, (2000.0, 1000.0))
@@ -737,6 +786,34 @@ class DirectionSetStateTests(unittest.TestCase):
         reloaded_app, reloaded_root = build_headless_app(self.settings_path)
         self.addCleanup(reloaded_root.destroy)
         self.assertEqual(reloaded_app.directions, expected)
+
+
+@unittest.skipUnless(tk_is_available(), "Tk が利用できない環境ではスキップします。")
+class XmpSidecarExportTests(unittest.TestCase):
+    """抽出済み画像への XMP 一括書き出しが対象を正しく選ぶことの回帰テスト。"""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.output_dir = Path(self.temp_dir.name) / "output"
+        self.output_dir.mkdir()
+        self.app, self.root = build_headless_app(Path(self.temp_dir.name) / ".settings.json")
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(self.root.destroy)
+
+    def test_write_xmp_sidecars_skips_mask_images(self) -> None:
+        for name in (
+            "room360_0000_00.jpg",
+            "room360_0000_01.jpg",
+            "room360_0000_00.jpg.mask.png",
+        ):
+            (self.output_dir / name).write_bytes(b"\xff\xd8\xff\xd9")
+
+        written = self.app._write_xmp_sidecars(self.output_dir, "room360", 18.0)
+
+        self.assertEqual(written, 2)
+        self.assertTrue((self.output_dir / "room360_0000_00.xmp").is_file())
+        self.assertTrue((self.output_dir / "room360_0000_01.xmp").is_file())
+        self.assertFalse((self.output_dir / "room360_0000_00.jpg.mask.xmp").exists())
 
 
 @unittest.skipUnless(tk_is_available(), "Tk が利用できない環境ではスキップします。")

@@ -146,6 +146,10 @@ python .\insta360_frame_extractor_gui.py
 - `フレームキャッシュ`
   - デコード済みフレームをロスレス保存し、次回以降の抽出で再利用します
   - 同じ動画に対して方向セットや画角を変えて何度も抽出する場合に効きます
+- `RealityScan用XMP`
+  - 抽出した各 JPG の隣に RealityScan / RealityCapture 用の XMP を書き出します
+  - 画角と解像度から 35mm 換算焦点距離を計算して渡すため、
+    アライメントのキャリブレーション推定が速く安定します
 
 両方 ON:
 
@@ -189,6 +193,28 @@ room360_0000_00.jpg.mask.png
 - 白: 使用
 - 黒: 除外
 - 検出がなかった場合はマスク画像を作りません
+
+### RealityScan用XMP
+
+`RealityScan用XMP` を ON にすると、抽出画像と同じフォルダに書き出します。
+
+```text
+{画像名}.xmp
+```
+
+例:
+
+```text
+room360_0000_00.jpg
+room360_0000_00.xmp
+```
+
+- 中身は RealityScan / RealityCapture の `xcr` 名前空間のみ
+- 焦点距離は v360 の flat 出力 (理想ピンホール) から計算した 35mm 換算値
+- 姿勢 (Rotation / Position) は書きません。座標系規約が未確認のため、
+  誤った事前情報でアライメントを壊すより渡さない方が安全です
+- 全画像を同じ `CalibrationGroup` / `DistortionGroup` に入れるので、
+  「1 台の合成カメラで撮った連番」として扱われます
 
 ## よく使う設定
 
